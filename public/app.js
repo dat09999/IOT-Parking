@@ -110,6 +110,20 @@ function initWebSocket() {
         // Trigger sounds
         if (msg.event.event_type.includes('ENTER_SLOT')) playCarBeep();
         if (msg.event.event_type.includes('GATE_ENTRY_OPEN')) playGateOpenSound();
+      } else if (msg.type === 'new_plate_detected') {
+        const plateEl = document.getElementById('stat-plate-text');
+        const plateSub = document.getElementById('stat-plate-sub');
+        if (plateEl) {
+          plateEl.textContent = msg.plate;
+          plateEl.className = 'text-lg font-black text-emerald-400 mt-1.5 font-mono tracking-widest animate-pulse';
+        }
+        if (plateSub) {
+          plateSub.textContent = `Vào lúc: ${new Date().toLocaleTimeString('vi-VN')} (${msg.gate})`;
+        }
+        showToast(`AI Camera nhận diện biển số: [${msg.plate}]`);
+        playTone(1046, 'sine', 0.2);
+        if (msg.event) prependEventLog(msg.event);
+        fetchAnalytics();
       }
     } catch (e) {
       console.error('Error parsing WS message:', e);
@@ -372,7 +386,10 @@ function createLogElement(log) {
 
   let icon = 'fa-circle-info';
   let color = 'text-cyan-400';
-  if (log.event_type.includes('ENTER')) {
+  if (log.event_type.includes('PLATE')) {
+    icon = 'fa-camera';
+    color = 'text-cyan-300';
+  } else if (log.event_type.includes('ENTER')) {
     icon = 'fa-car-side';
     color = 'text-emerald-400';
   } else if (log.event_type.includes('LEAVE')) {

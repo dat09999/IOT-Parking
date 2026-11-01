@@ -121,7 +121,7 @@
     </div>
 
     <!-- Quick KPI Metrics Cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
       
       <!-- Card 1: Total Slots -->
       <div class="glass-panel rounded-2xl p-4 relative overflow-hidden group hover:border-cyan-500/40 transition-all duration-300">
@@ -173,7 +173,21 @@
         </div>
       </div>
 
-      <!-- Card 4: Parking Lot Full Alert -->
+      <!-- Card 4: AI License Plate Scanner HUD -->
+      <div id="card-alpr-banner" class="glass-panel rounded-2xl p-4 relative overflow-hidden transition-all duration-300 border border-cyan-500/30">
+        <div class="flex justify-between items-start">
+          <div>
+            <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">AI Biển Số Gần Nhất</p>
+            <h3 id="stat-plate-text" class="text-lg font-black text-cyan-300 mt-1.5 font-mono tracking-widest">---</h3>
+          </div>
+          <div class="w-12 h-12 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center text-xl border border-cyan-500/20">
+            <i class="fa-solid fa-camera"></i>
+          </div>
+        </div>
+        <p id="stat-plate-sub" class="text-xs text-slate-400 mt-3 font-mono">Camera: FastALPR Live</p>
+      </div>
+
+      <!-- Card 5: Parking Lot Full Alert -->
       <div id="card-status-banner" class="glass-panel rounded-2xl p-4 relative overflow-hidden transition-all duration-300">
         <div class="flex justify-between items-start">
           <div>
