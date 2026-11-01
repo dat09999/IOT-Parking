@@ -170,8 +170,21 @@ async function toggleWebcamPreview() {
     btnText.textContent = 'Mở Camera Trên Web';
   } else {
     try {
+      // Tìm camera iVCam nếu có nhiều thiết bị
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      let targetDeviceId = undefined;
+      
+      const ivcamDevice = videoDevices.find(d => d.label.toLowerCase().includes('ivcam') || d.label.toLowerCase().includes('e2esoft'));
+      if (ivcamDevice) {
+        targetDeviceId = { exact: ivcamDevice.deviceId };
+      } else if (videoDevices.length > 1) {
+        // Neu co tu 2 camera tro len thi uu tien camera phu (thuong la iVCam)
+        targetDeviceId = { exact: videoDevices[videoDevices.length - 1].deviceId };
+      }
+
       webcamStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } } 
+        video: targetDeviceId ? { deviceId: targetDeviceId, width: { ideal: 1280 } } : { width: { ideal: 1280 } } 
       });
       video.srcObject = webcamStream;
       video.classList.remove('hidden');
