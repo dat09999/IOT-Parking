@@ -288,9 +288,13 @@ async function toggleWebcamPreview() {
   }
 }
 
-// ================= THUẬT TOÁN TỰ ĐỘNG PHÁT HIỆN BIỂN SỐ VÀ CĂN CHỈNH GÓC (AUTO LOCALIZATION & ALIGNMENT) =================
+// ================= THUẬT TOÁN CHỤP 20 ẢNH / 5S - LỌC ẢNH NÉT NHẤT & TỰ ĐỘNG QUÉT LẠI =================
 
-// Hàm đo độ sắc nét của ảnh (Sharpness Gradient Variance)
+let isCycleRunning = false;
+let retryTimer = null;
+let countdownInterval = null;
+
+// Hàm đo độ sắc nét của ảnh (Laplacian / Edge gradient variance)
 function evaluateSharpness(imageData) {
   const data = imageData.data;
   const w = imageData.width;
@@ -304,228 +308,83 @@ function evaluateSharpness(imageData) {
       const g = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
       const gR = 0.299 * data[idx + 4] + 0.587 * data[idx + 5] + 0.114 * data[idx + 6];
       const gD = 0.299 * data[idx + w * 4] + 0.587 * data[idx + w * 4 + 1] + 0.114 * data[idx + w * 4 + 2];
-      totalDiff += Math.abs(g - gR) + Math.abs(g - gD);
+      totalDiff += Math.abs(g - gR) * 1.5 + Math.abs(g - gD);
       count++;
     }
   }
   return count > 0 ? (totalDiff / count) : 0;
 }
 
-// 1. Tự động định vị vùng chứa biển số xe trên toàn khung hình (Auto Plate Localization)
-function detectPlateRegion(srcCanvas) {
-  const w = srcCanvas.width;
-  const h = srcCanvas.height;
-  const ctx = srcCanvas.getContext('2d', { willReadFrequently: true });
-  const imgData = ctx.getImageData(0, 0, w, h);
+// Tiền xử lý tăng cường tương phản và làm rõ nét ký tự cho OCR
+function enhanceCanvasForOCR(srcCanvas) {
+  const targetCanvas = document.createElement('canvas');
+  // Kích thước chuẩn dễ nhận diện nhất (rộng 720px)
+  const targetW = 720;
+  const targetH = Math.round((srcCanvas.height / srcCanvas.width) * targetW);
+  targetCanvas.width = targetW;
+  targetCanvas.height = targetH;
+
+  const ctx = targetCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(srcCanvas, 0, 0, targetW, targetH);
+
+  const imgData = ctx.getImageData(0, 0, targetW, targetH);
   const d = imgData.data;
 
-  // Chia ảnh thành lưới các khối (Block Grid 32x24) để tìm vùng có mật độ viền và ký tự cao nhất
-  const gridX = 32;
-  const gridY = 24;
-  const blockW = Math.floor(w / gridX);
-  const blockH = Math.floor(h / gridY);
-  const edgeDensity = new Float32Array(gridX * gridY);
-
-  for (let gy = 0; gy < gridY; gy++) {
-    for (let gx = 0; gx < gridX; gx++) {
-      let gradSum = 0;
-      let samples = 0;
-      const startX = gx * blockW;
-      const startY = gy * blockH;
-
-      for (let y = startY; y < startY + blockH - 1; y += 2) {
-        for (let x = startX; x < startX + blockW - 1; x += 2) {
-          const idx = (y * w + x) * 4;
-          const lum = 0.299 * d[idx] + 0.587 * d[idx + 1] + 0.114 * d[idx + 2];
-          const lumR = 0.299 * d[idx + 4] + 0.587 * d[idx + 5] + 0.114 * d[idx + 6];
-          const lumD = 0.299 * d[idx + w * 4] + 0.587 * d[idx + w * 4 + 1] + 0.114 * d[idx + w * 4 + 2];
-          gradSum += Math.abs(lum - lumR) * 1.5 + Math.abs(lum - lumD); // Ưu tiên cạnh dọc (các chữ số dập nổi)
-          samples++;
-        }
-      }
-      edgeDensity[gy * gridX + gx] = samples > 0 ? (gradSum / samples) : 0;
-    }
-  }
-
-  // Tìm cửa sổ trượt (Sliding Window) có tỷ lệ chữ nhật biển số (tỷ lệ 2.5:1 đến 4.5:1) có tổng mật độ cạnh cao nhất
-  let maxScore = -1;
-  let bestBox = null;
-
-  // Thử các kích thước cửa sổ tương ứng với biển số xe từ cỡ trung đến cận cảnh
-  const windowSizes = [
-    { gw: 14, gh: 5 },  // Biển số cỡ trung
-    { gw: 18, gh: 6 },  // Biển số gần
-    { gw: 22, gh: 8 },  // Biển số rất to (như chụp thẳng màn hình)
-    { gw: 10, gh: 4 }   // Biển số xe ở xa
-  ];
-
-  for (const win of windowSizes) {
-    for (let gy = 1; gy <= gridY - win.gh - 1; gy++) {
-      for (let gx = 1; gx <= gridX - win.gw - 1; gx++) {
-        let score = 0;
-        for (let y = gy; y < gy + win.gh; y++) {
-          for (let x = gx; x < gx + win.gw; x++) {
-            score += edgeDensity[y * gridX + x];
-          }
-        }
-        // Thưởng điểm cho vùng có tương phản cao
-        if (score > maxScore) {
-          maxScore = score;
-          bestBox = {
-            x: Math.max(0, gx * blockW),
-            y: Math.max(0, gy * blockH),
-            w: Math.min(w, win.gw * blockW),
-            h: Math.min(h, win.gh * blockH)
-          };
-        }
-      }
-    }
-  }
-
-  // Nếu không tìm thấy hoặc ảnh chiếm phần lớn màn hình, fallback về vùng 85% trung tâm
-  if (!bestBox || bestBox.w < 60) {
-    bestBox = {
-      x: Math.floor(w * 0.08),
-      y: Math.floor(h * 0.10),
-      w: Math.floor(w * 0.84),
-      h: Math.floor(h * 0.80)
-    };
-  } else {
-    // Mở rộng thêm 12% lề để không bao giờ bị cắt cụt mép chữ số biển
-    const padX = Math.floor(bestBox.w * 0.12);
-    const padY = Math.floor(bestBox.h * 0.15);
-    bestBox.x = Math.max(0, bestBox.x - padX);
-    bestBox.y = Math.max(0, bestBox.y - padY);
-    bestBox.w = Math.min(w - bestBox.x, bestBox.w + padX * 2);
-    bestBox.h = Math.min(h - bestBox.y, bestBox.h + padY * 2);
-  }
-
-  return bestBox;
-}
-
-// 2. Thuật toán Tự động căn chỉnh xoay thẳng góc (Auto Deskew & Alignment)
-function alignAndStraightenPlate(srcCanvas, cropBox) {
-  // Tạo canvas phụ chứa vùng crop
-  const cropCanvas = document.createElement('canvas');
-  cropCanvas.width = cropBox.w;
-  cropCanvas.height = cropBox.h;
-  const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
-  cropCtx.drawImage(srcCanvas, cropBox.x, cropBox.y, cropBox.w, cropBox.h, 0, 0, cropBox.w, cropBox.h);
-
-  // Thu nhỏ tạm thời để tính góc xoay nắn nhanh trong vài mili giây
-  const testW = 160;
-  const testH = Math.max(30, Math.round(cropBox.h * 160 / cropBox.w));
-  const testCanvas = document.createElement('canvas');
-  testCanvas.width = testW;
-  testCanvas.height = testH;
-  const testCtx = testCanvas.getContext('2d', { willReadFrequently: true });
-  testCtx.drawImage(cropCanvas, 0, 0, testW, testH);
-
-  // Đổi sang nhị phân để đo Horizontal Projection Profile
-  const tImg = testCtx.getImageData(0, 0, testW, testH);
-  const td = tImg.data;
+  // Tìm min, max độ sáng để Auto-Contrast Stretch
   let minLum = 255, maxLum = 0;
-  for (let i = 0; i < td.length; i += 4) {
-    const l = 0.299 * td[i] + 0.587 * td[i + 1] + 0.114 * td[i + 2];
+  for (let i = 0; i < d.length; i += 4) {
+    const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
     if (l < minLum) minLum = l;
     if (l > maxLum) maxLum = l;
   }
-  const midLum = minLum + (maxLum - minLum) * 0.48;
+  const range = Math.max(maxLum - minLum, 1);
+  const threshold = minLum + range * 0.48;
 
-  // Thử các góc xoay từ -14° đến +14° (bước 2°)
-  // Khi biển số được xoay thẳng, các hàng chữ tạo ra đỉnh/đáy chiếu ngang có phương sai cực đại!
-  let bestAngle = 0;
-  let maxVariance = -1;
-
-  for (let angle = -14; angle <= 14; angle += 2) {
-    const rad = (angle * Math.PI) / 180;
-    const cos = Math.cos(rad);
-    const sin = Math.sin(rad);
-    const midX = testW / 2;
-    const midY = testH / 2;
-    
-    // Chiếu theo trục ngang
-    const rowCounts = new Int32Array(testH);
-    for (let y = 0; y < testH; y++) {
-      let blackPixels = 0;
-      for (let x = 0; x < testW; x += 2) {
-        // Ánh xạ xoay
-        const srcX = Math.round(cos * (x - midX) - sin * (y - midY) + midX);
-        const srcY = Math.round(sin * (x - midX) + cos * (y - midY) + midY);
-        if (srcX >= 0 && srcX < testW && srcY >= 0 && srcY < testH) {
-          const idx = (srcY * testW + srcX) * 4;
-          const lum = 0.299 * td[idx] + 0.587 * td[idx + 1] + 0.114 * td[idx + 2];
-          if (lum < midLum) blackPixels++;
-        }
-      }
-      rowCounts[y] = blackPixels;
-    }
-
-    // Tính phương sai của vector chiếu
-    let mean = 0;
-    for (let i = 0; i < testH; i++) mean += rowCounts[i];
-    mean /= testH;
-    let variance = 0;
-    for (let i = 0; i < testH; i++) {
-      const diff = rowCounts[i] - mean;
-      variance += diff * diff;
-    }
-
-    if (variance > maxVariance) {
-      maxVariance = variance;
-      bestAngle = angle;
-    }
+  // Chuyển đổi tăng tương phản cao
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    const val = (lum < threshold) ? Math.max(0, lum - 35) : Math.min(255, lum + 40);
+    d[i] = val;
+    d[i + 1] = val;
+    d[i + 2] = val;
   }
 
-  // 3. Thực hiện xoay nắn phẳng và chuyển nhị phân hóa ảnh kết quả
-  const targetH = 110;
-  const targetW = Math.round((cropBox.w / cropBox.h) * targetH);
-  const alignedCanvas = document.createElement('canvas');
-  alignedCanvas.width = targetW;
-  alignedCanvas.height = targetH;
-  const alignedCtx = alignedCanvas.getContext('2d', { willReadFrequently: true });
-
-  alignedCtx.save();
-  alignedCtx.translate(targetW / 2, targetH / 2);
-  alignedCtx.rotate((bestAngle * Math.PI) / 180);
-  alignedCtx.drawImage(cropCanvas, -targetW / 2, -targetH / 2, targetW, targetH);
-  alignedCtx.restore();
-
-  // Tiền xử lý Auto-Contrast & Nhị phân hóa đen trắng siêu nét
-  const alignedImg = alignedCtx.getImageData(0, 0, targetW, targetH);
-  const ad = alignedImg.data;
-  let aMin = 255, aMax = 0;
-  for (let i = 0; i < ad.length; i += 4) {
-    const l = 0.299 * ad[i] + 0.587 * ad[i + 1] + 0.114 * ad[i + 2];
-    if (l < aMin) aMin = l;
-    if (l > aMax) aMax = l;
-  }
-  const aThresh = aMin + (aMax - aMin) * 0.50;
-  for (let i = 0; i < ad.length; i += 4) {
-    const l = 0.299 * ad[i] + 0.587 * ad[i + 1] + 0.114 * ad[i + 2];
-    const val = (l < aThresh) ? 0 : 255;
-    ad[i] = val;
-    ad[i + 1] = val;
-    ad[i + 2] = val;
-  }
-  alignedCtx.putImageData(alignedImg, 0, 0);
-
-  return {
-    canvas: alignedCanvas,
-    angle: bestAngle,
-    box: cropBox
-  };
+  ctx.putImageData(imgData, 0, 0);
+  return targetCanvas;
 }
 
 // Chuẩn hóa và làm sạch chuỗi biển số nhận diện
 function cleanAndFormatPlate(rawText) {
   if (!rawText) return null;
-  let s = rawText.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  
-  // Tự động nhận diện mẫu biển số Việt Nam: 2 số đầu + 1 hoặc 2 chữ series + 4 đến 5 số đuôi
-  const match = s.match(/([0-9]{2}[A-Z]{1,2}[0-9]{4,5})/);
-  if (match) {
-    const p = match[0];
+
+  // 1. Tìm trực tiếp mẫu có dấu gạch ngang (ví dụ 36C-925.64, 30A-999.99)
+  const directMatch = rawText.match(/([0-9]{2}[A-Z]{1,2}[-.\s]?[0-9]{3,5}[.]?[0-9]{0,2})/i);
+  if (directMatch && directMatch[0].length >= 6) {
+    const raw = directMatch[0].toUpperCase().replace(/\s+/g, '');
+    const clean = raw.replace(/[^A-Z0-9]/g, '');
+    const prov = clean.slice(0, 2);
+    let series = '';
+    let numPart = '';
+    if (isNaN(clean[2]) && isNaN(clean[3])) {
+      series = clean.slice(2, 4);
+      numPart = clean.slice(4);
+    } else {
+      series = clean.slice(2, 3);
+      numPart = clean.slice(3);
+    }
+    if (numPart.length === 5) {
+      return `${prov}${series}-${numPart.slice(0, 3)}.${numPart.slice(3)}`;
+    } else if (numPart.length === 4) {
+      return `${prov}${series}-${numPart}`;
+    }
+    return raw;
+  }
+
+  // 2. Tìm trong chuỗi bỏ ký tự đặc biệt
+  const cleanAll = rawText.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const vnMatch = cleanAll.match(/([0-9]{2}[A-Z]{1,2}[0-9]{4,5})/);
+  if (vnMatch) {
+    const p = vnMatch[0];
     const prov = p.slice(0, 2);
     let series = '';
     let numPart = '';
@@ -542,17 +401,52 @@ function cleanAndFormatPlate(rawText) {
       return `${prov}${series}-${numPart}`;
     }
   }
-  
-  // Trường hợp có dấu gạch ngang hoặc dấu chấm sẵn
-  const altMatch = rawText.match(/([0-9]{2}[A-Z]{1,2}[-.\s]?[0-9]{3,5}[.]?[0-9]{0,2})/i);
-  if (altMatch && altMatch[0].length >= 6) {
-    return altMatch[0].toUpperCase().replace(/\s+/g, '');
-  }
+
   return null;
 }
 
-// ================= HÀM KÍCH HOẠT NHẬN DIỆN BIỂN SỐ TỰ ĐỘNG ALIGNMENT (BURST MODE 2-3 FRAME) =================
-async function triggerBurstRecognition(isManual = false) {
+// Xử lý khi quét đợt này chưa ra kết quả: Đếm ngược 5 giây rồi tự động quét lại
+function handleRecognitionFailedAndScheduleRetry(isManual) {
+  const hudPlate = document.getElementById('hud-plate-display');
+  const hudAction = document.getElementById('hud-gate-action');
+  
+  if (hudPlate && !hudPlate.classList.contains('bg-emerald-400')) {
+    hudPlate.textContent = 'CHƯA RÕ BIỂN SỐ';
+    hudPlate.className = 'bg-slate-700 text-slate-300 px-4 py-2.5 rounded-xl font-mono text-center font-bold text-xl tracking-wider';
+  }
+
+  // Đếm ngược 5 giây
+  let countdown = 5;
+  if (hudAction) {
+    hudAction.textContent = `Chưa rõ biển số. Tự động chụp lại sau ${countdown}s...`;
+    hudAction.className = 'font-semibold text-amber-400';
+  }
+
+  if (countdownInterval) clearInterval(countdownInterval);
+  countdownInterval = setInterval(() => {
+    countdown--;
+    if (countdown > 0) {
+      if (hudAction) hudAction.textContent = `Chưa rõ biển số. Tự động chụp lại sau ${countdown}s...`;
+    } else {
+      clearInterval(countdownInterval);
+    }
+  }, 1000);
+
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    if (webcamStream) {
+      console.log('🔄 [Hết 5s chờ] Tự động bắt đầu đợt chụp 20 ảnh tiếp theo...');
+      run20FramesCaptureCycle(false);
+    }
+  }, 5000);
+
+  if (isManual) {
+    showToast('⚠️ Chưa đọc được biển số. Hệ thống sẽ tự động quét lại sau 5s!');
+  }
+}
+
+// ================= HÀM CHỤP 20 ẢNH - LỌC TOP ẢNH NÉT NHẤT & NHẬN DIỆN =================
+async function run20FramesCaptureCycle(isManual = false) {
   const video = document.getElementById('webcam-video');
   const canvas = document.getElementById('webcam-canvas');
   const hudPlate = document.getElementById('hud-plate-display');
@@ -561,25 +455,27 @@ async function triggerBurstRecognition(isManual = false) {
   const hudAction = document.getElementById('hud-gate-action');
   const btnScan = document.getElementById('text-btn-scan');
   const laser = document.getElementById('hud-laser-line');
-  const detectedBoxEl = document.getElementById('hud-detected-box');
-  const detectedTagEl = document.getElementById('hud-detected-tag');
 
   if (!video || !webcamStream || video.videoWidth === 0) {
     if (isManual) alert('Vui lòng bấm "Bật Camera" trước khi quét!');
     return;
   }
 
-  if (isProcessingRecognition) return;
-  isProcessingRecognition = true;
+  if (isCycleRunning) return;
+  isCycleRunning = true;
+
+  if (retryTimer) clearTimeout(retryTimer);
+  if (countdownInterval) clearInterval(countdownInterval);
 
   if (laser) laser.classList.remove('opacity-0');
-  if (btnScan) btnScan.textContent = '⚡ Đang chụp & Align...';
+  if (btnScan) btnScan.textContent = '⚡ Đang chụp 20 ảnh...';
+  
   if (hudPlate) {
-    hudPlate.textContent = 'TỰ ĐỘNG ALIGN & QUÉT...';
+    hudPlate.textContent = 'CHỤP 20 ẢNH... (0/20)';
     hudPlate.className = 'bg-cyan-500 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-cyan-500/30 border-2 border-cyan-300 animate-pulse';
   }
   if (hudAction) {
-    hudAction.textContent = 'Tự động phát hiện vị trí & xoay thẳng biển số...';
+    hudAction.textContent = 'Đang chụp liên tiếp 20 bức ảnh để lọc ảnh nét nhất...';
     hudAction.className = 'font-semibold text-cyan-400';
   }
 
@@ -592,114 +488,110 @@ async function triggerBurstRecognition(isManual = false) {
 
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-
-    // Bước 1: Chụp liên tiếp 3 ảnh (cách nhau 40ms) và chọn ảnh có độ sắc nét toàn cảnh cao nhất
     const burstFrames = [];
-    for (let i = 0; i < 3; i++) {
-      const fullCanvas = document.createElement('canvas');
-      fullCanvas.width = vw;
-      fullCanvas.height = vh;
-      const fCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
-      fCtx.drawImage(video, 0, 0, vw, vh);
 
-      const testImgData = fCtx.getImageData(0, 0, vw, vh);
-      const sharpness = evaluateSharpness(testImgData);
-      burstFrames.push({ canvas: fullCanvas, sharpness });
+    // Chụp 20 bức ảnh (mỗi bức cách nhau 90ms)
+    const TOTAL_FRAMES = 20;
+    const INTERVAL_MS = 90;
 
-      if (i < 2) await new Promise(r => setTimeout(r, 40));
-    }
+    for (let i = 1; i <= TOTAL_FRAMES; i++) {
+      if (!webcamStream) break;
 
-    // Chọn khung hình nét nhất trong 3 ảnh
-    burstFrames.sort((a, b) => b.sharpness - a.sharpness);
-    const bestFrame = burstFrames[0];
+      const frameCanvas = document.createElement('canvas');
+      const targetW = 800;
+      const targetH = Math.round((vh / vw) * targetW);
+      frameCanvas.width = targetW;
+      frameCanvas.height = targetH;
+      const fCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+      fCtx.drawImage(video, 0, 0, targetW, targetH);
 
-    // Bước 2: Tự động phát hiện vị trí biển số trên toàn khung hình (Auto Plate Localization)
-    const plateBox = detectPlateRegion(bestFrame.canvas);
-    console.log('🎯 [Auto Localization]:', plateBox, 'Độ nét frame:', bestFrame.sharpness.toFixed(1));
+      const imgData = fCtx.getImageData(0, 0, targetW, targetH);
+      const sharpness = evaluateSharpness(imgData);
 
-    // Bước 3: Tự động căn chỉnh xoay thẳng góc (Auto Alignment / Deskew)
-    const alignedResult = alignAndStraightenPlate(bestFrame.canvas, plateBox);
-    console.log(`📐 [Auto Alignment]: Xoay ${alignedResult.angle}° để nắn thẳng biển số`);
+      burstFrames.push({
+        canvas: frameCanvas,
+        sharpness: sharpness,
+        index: i
+      });
 
-    // Hiển thị khung highlight bám theo biển số trên camera HUD
-    if (detectedBoxEl) {
-      const leftPct = (plateBox.x / vw) * 100;
-      const topPct = (plateBox.y / vh) * 100;
-      const widthPct = (plateBox.w / vw) * 100;
-      const heightPct = (plateBox.h / vh) * 100;
-      detectedBoxEl.style.left = `${leftPct}%`;
-      detectedBoxEl.style.top = `${topPct}%`;
-      detectedBoxEl.style.width = `${widthPct}%`;
-      detectedBoxEl.style.height = `${heightPct}%`;
-      detectedBoxEl.classList.remove('hidden');
-      if (detectedTagEl) {
-        detectedTagEl.textContent = `ALIGN: ${alignedResult.angle >= 0 ? '+' : ''}${alignedResult.angle}°`;
+      if (hudPlate && i % 3 === 0) {
+        hudPlate.textContent = `CHỤP ẢNH: ${i}/${TOTAL_FRAMES}`;
       }
+
+      await new Promise(resolve => setTimeout(resolve, INTERVAL_MS));
     }
 
-    // Vẽ ảnh đã align lên canvas chính để hiển thị kiểm tra
-    canvas.width = alignedResult.canvas.width;
-    canvas.height = alignedResult.canvas.height;
-    canvas.getContext('2d').drawImage(alignedResult.canvas, 0, 0);
+    if (burstFrames.length === 0) {
+      throw new Error('Không chụp được khung hình');
+    }
 
-    // Bước 4: Chạy OCR trên ảnh biển số đã tự động căn chỉnh và nắn thẳng
+    // Sắp xếp chọn ra 3 bức ảnh có độ nét CAO NHẤT
+    burstFrames.sort((a, b) => b.sharpness - a.sharpness);
+    const topFrames = burstFrames.slice(0, 3);
+    const bestFrame = topFrames[0];
+
+    console.log(`📸 [Chụp 20 ảnh xong] Top 1 nét nhất: ${bestFrame.sharpness.toFixed(1)} (Frame #${bestFrame.index})`);
+
+    // Vẽ bức ảnh nét nhất lên canvas chính để xem trước
+    canvas.width = bestFrame.canvas.width;
+    canvas.height = bestFrame.canvas.height;
+    canvas.getContext('2d').drawImage(bestFrame.canvas, 0, 0);
+
+    if (hudPlate) {
+      hudPlate.textContent = 'ĐANG NHẬN DIỆN...';
+    }
+
+    // Thử nhận diện lần lượt với top các ảnh nét nhất
     let detectedPlate = null;
-    if (tesseractWorker) {
-      const res = await tesseractWorker.recognize(alignedResult.canvas);
-      detectedPlate = cleanAndFormatPlate(res.data.text);
-      console.log('⚡ [OCR Raw]:', res.data.text, '-> [Detected Plate]:', detectedPlate);
+    let confidence = 0.98;
 
-      // Nếu lần 1 chưa ra, thử nhận diện thêm với ảnh crop gốc chưa xoay để tối đa tỷ lệ trúng
-      if (!detectedPlate) {
-        const fallbackCanv = document.createElement('canvas');
-        fallbackCanv.width = plateBox.w;
-        fallbackCanv.height = plateBox.h;
-        fallbackCanv.getContext('2d').drawImage(bestFrame.canvas, plateBox.x, plateBox.y, plateBox.w, plateBox.h, 0, 0, plateBox.w, plateBox.h);
-        const res2 = await tesseractWorker.recognize(fallbackCanv);
-        detectedPlate = cleanAndFormatPlate(res2.data.text);
+    if (tesseractWorker) {
+      for (const candidate of topFrames) {
+        const enhanced = enhanceCanvasForOCR(candidate.canvas);
+        const res = await tesseractWorker.recognize(enhanced);
+        const plate = cleanAndFormatPlate(res.data.text);
+        if (plate) {
+          detectedPlate = plate;
+          console.log(`✅ [Thành công] Nhận diện được biển số: ${detectedPlate} từ frame #${candidate.index} (Độ nét: ${candidate.sharpness.toFixed(1)})`);
+          break;
+        }
       }
     }
 
     const elapsed = Math.round(performance.now() - startTime);
 
     if (detectedPlate) {
+      // NHẬN DIỆN THÀNH CÔNG!
       lastRecognizedPlate = detectedPlate;
       lastRecognizedTime = Date.now();
-      showToast(`⚡ Nhận diện [${detectedPlate}] trong ${elapsed}ms (Align: ${alignedResult.angle}°)`);
+      showToast(`⚡ Nhận diện thành công [${detectedPlate}] trong ${elapsed}ms!`);
 
-      // Gửi ngay lên Cloud Server để đối chiếu CSDL Whitelist
+      // Gửi ngay lên Cloud Server để đối chiếu Whitelist CSDL và ra quyết định
       const resp = await fetch('/api/parking/alpr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           plate: detectedPlate,
           gate: 'entry',
-          confidence: 0.98
+          confidence: confidence
         })
       });
       const data = await resp.json();
       console.log('Kết quả từ Cloud Server:', data);
+
+      isCycleRunning = false;
+      if (laser) laser.classList.add('opacity-0');
+      if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
+      return; // Dừng, không quét lại nữa
     } else {
-      if (hudPlate && !hudPlate.classList.contains('bg-emerald-400')) {
-        hudPlate.textContent = 'CHƯA RÕ BIỂN SỐ';
-        hudPlate.className = 'bg-slate-700 text-slate-300 px-4 py-2.5 rounded-xl font-mono text-center font-bold text-xl tracking-wider';
-        setTimeout(() => {
-          if (currentVehicleAtEntry === 0 && hudPlate.textContent === 'CHƯA RÕ BIỂN SỐ') {
-            hudPlate.textContent = 'CHỜ XE ĐẾN...';
-            hudPlate.className = 'bg-amber-400 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-amber-400/20 border-2 border-amber-300';
-            if (detectedBoxEl) detectedBoxEl.classList.add('hidden');
-          }
-        }, 2200);
-      }
-      if (isManual) {
-        showToast('⚠️ Không đọc được biển số. Vui lòng giữ camera ổn định!');
-      }
+      // CHƯA NHẬN DIỆN ĐƯỢC -> HẸN GIỜ 5S SAU TỰ ĐỘNG CHỤP LẠI
+      handleRecognitionFailedAndScheduleRetry(isManual);
     }
   } catch (err) {
-    console.error('Lỗi nhận diện:', err);
-    if (isManual) showToast('Lỗi: ' + err.message);
+    console.error('Lỗi chu kỳ quét:', err);
+    handleRecognitionFailedAndScheduleRetry(isManual);
   } finally {
-    isProcessingRecognition = false;
+    isCycleRunning = false;
     if (laser) laser.classList.add('opacity-0');
     if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
   }
@@ -709,11 +601,11 @@ async function triggerBurstRecognition(isManual = false) {
 function manualTriggerScan() {
   if (!webcamStream) {
     toggleWebcamPreview().then(() => {
-      setTimeout(() => triggerBurstRecognition(true), 800);
+      setTimeout(() => run20FramesCaptureCycle(true), 800);
     });
     return;
   }
-  triggerBurstRecognition(true);
+  run20FramesCaptureCycle(true);
 }
 
 // Xử lý sự kiện cảm biến xe đến cổng vào (từ ESP32 hoặc bộ giả lập)
@@ -721,7 +613,6 @@ function handleVehicleArrivalSensor(isArrived) {
   const hudPlate = document.getElementById('hud-plate-display');
   const hudConf = document.getElementById('hud-confidence');
   const hudAction = document.getElementById('hud-gate-action');
-  const detectedBoxEl = document.getElementById('hud-detected-box');
   const simLabel = document.getElementById('sim-label-vehicle');
 
   if (simLabel) {
@@ -733,24 +624,26 @@ function handleVehicleArrivalSensor(isArrived) {
     if (currentVehicleAtEntry === 0) {
       currentVehicleAtEntry = 1;
       playTone(880, 'sine', 0.15);
-      showToast('🚗 [CẢM BIẾN] Xe đã đến cổng vào! Kích hoạt nhận diện biển số...');
+      showToast('🚗 [CẢM BIẾN] Xe đã đến cổng vào! Bắt đầu chụp 20 ảnh...');
       
       // Tự động bật camera nếu đang tắt
       if (!webcamStream) {
         startCameraStream().then(() => {
-          setTimeout(() => triggerBurstRecognition(false), 600);
+          setTimeout(() => run20FramesCaptureCycle(false), 600);
         });
       } else {
-        triggerBurstRecognition(false);
+        run20FramesCaptureCycle(false);
       }
     }
   } else {
     currentVehicleAtEntry = 0;
-    // Khi xe đi qua, sau 3.5s nếu không có xe mới thì đưa giao diện về trạng thái CHỜ XE ĐẾN
+    if (retryTimer) clearTimeout(retryTimer);
+    if (countdownInterval) clearInterval(countdownInterval);
+
+    // Khi xe đi qua, sau 4s đưa giao diện về trạng thái CHỜ XE ĐẾN
     setTimeout(() => {
       if (currentVehicleAtEntry === 0) {
-        if (detectedBoxEl) detectedBoxEl.classList.add('hidden');
-        if (hudPlate && !isProcessingRecognition) {
+        if (hudPlate && !isCycleRunning) {
           hudPlate.textContent = 'CHỜ XE ĐẾN...';
           hudPlate.className = 'bg-amber-400 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-amber-400/20 border-2 border-amber-300';
         }
