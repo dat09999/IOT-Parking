@@ -10,6 +10,8 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Tesseract.js Client-Side OCR Engine -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <!-- Custom Advanced Styles -->
   <link rel="stylesheet" href="style.css">
 </head>
@@ -476,6 +478,10 @@
           <button onclick="toggleWebcamPreview()" id="btn-toggle-cam" class="btn-neon px-3.5 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-semibold flex items-center gap-1.5 transition">
             <i class="fa-solid fa-camera"></i>
             <span id="text-btn-cam">Bật Camera</span>
+          </button>
+          <button onclick="scanLicensePlateNow()" id="btn-scan-now" class="btn-neon px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold flex items-center gap-1.5 transition shadow-lg shadow-amber-500/30">
+            <i class="fa-solid fa-expand"></i>
+            <span id="text-btn-scan">Quét Biển Số Ngay</span>
           </button>
         </div>
       </div>

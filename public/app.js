@@ -227,13 +227,95 @@ async function toggleWebcamPreview() {
   const btnText = document.getElementById('text-btn-cam');
 
   if (webcamStream) {
+    stopAutoScanLoop();
     webcamStream.getTracks().forEach(track => track.stop());
     webcamStream = null;
     video.classList.add('hidden');
     placeholder.classList.remove('hidden');
     btnText.textContent = 'Bật Camera';
   } else {
-    startCameraStream();
+    await startCameraStream();
+    startAutoScanLoop();
+  }
+}
+
+// Client-Side Real-time Optical Character Recognition (OCR) Engine
+let autoScanInterval = null;
+let isScanning = false;
+
+function startAutoScanLoop() {
+  if (autoScanInterval) clearInterval(autoScanInterval);
+  // Tu dong quet dinh ky moi 2.5 giay
+  autoScanInterval = setInterval(() => {
+    if (webcamStream && !isScanning) {
+      scanLicensePlateNow(false);
+    }
+  }, 2500);
+}
+
+function stopAutoScanLoop() {
+  if (autoScanInterval) {
+    clearInterval(autoScanInterval);
+    autoScanInterval = null;
+  }
+}
+
+async function scanLicensePlateNow(manual = true) {
+  const video = document.getElementById('webcam-video');
+  const canvas = document.getElementById('webcam-canvas');
+  const hudPlate = document.getElementById('hud-plate-display');
+  const btnScan = document.getElementById('text-btn-scan');
+
+  if (!video || !webcamStream || video.videoWidth === 0) {
+    if (manual) alert('Vui lòng bật Camera trước khi quét biển số!');
+    return;
+  }
+
+  if (isScanning) return;
+  isScanning = true;
+
+  if (manual && btnScan) btnScan.textContent = 'Đang nhận diện...';
+
+  try {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Chay OCR qua Tesseract truc tiep tren trinh duyet
+    if (window.Tesseract) {
+      const result = await Tesseract.recognize(canvas, 'eng', {
+        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-'
+      });
+      const rawText = result.data.text.toUpperCase().replace(/\s+/g, '');
+      
+      // Loc tim chuoi dinh dang bien so xe (VD: 36C-925.64, 30A-123.45, 29B1-23456)
+      const plateRegex = /([0-9]{2}[A-Z]{1,2}[-.]?[0-9]{3,5}[.]?[0-9]{0,2})/;
+      const match = rawText.match(plateRegex);
+      
+      if (match && match[0].length >= 6) {
+        const detectedPlate = match[0];
+        console.log('[OCR Success] Phat hien bien so:', detectedPlate);
+        
+        // Gui truc tiep len Cloud Server API
+        await fetch('/api/parking/alpr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            plate: detectedPlate,
+            gate: 'entry',
+            confidence: 0.96
+          })
+        });
+      } else if (manual) {
+        showToast('Chưa nhận diện rõ biển số, hãy đưa camera lại gần hơn');
+      }
+    }
+  } catch (err) {
+    console.error('Lỗi nhận diện OCR:', err);
+  } finally {
+    isScanning = false;
+    if (manual && btnScan) btnScan.textContent = 'Quét Biển Số Ngay';
   }
 }
 
