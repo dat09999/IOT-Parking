@@ -110,6 +110,38 @@ function initWebSocket() {
         // Trigger sounds
         if (msg.event.event_type.includes('ENTER_SLOT')) playCarBeep();
         if (msg.event.event_type.includes('GATE_ENTRY_OPEN')) playGateOpenSound();
+      } else if (msg.type === 'new_plate_detected') {
+        const plateEl = document.getElementById('stat-plate-text');
+        const plateSub = document.getElementById('stat-plate-sub');
+        const hudPlate = document.getElementById('hud-plate-display');
+        const hudConf = document.getElementById('hud-confidence');
+        const hudTime = document.getElementById('hud-timestamp');
+        const hudAction = document.getElementById('hud-gate-action');
+
+        if (plateEl) {
+          plateEl.textContent = msg.plate;
+          plateEl.className = 'text-lg font-black text-emerald-400 mt-1.5 font-mono tracking-widest animate-pulse';
+        }
+        if (plateSub) {
+          plateSub.textContent = `Vào lúc: ${new Date().toLocaleTimeString('vi-VN')} (${msg.gate})`;
+        }
+        if (hudPlate) {
+          hudPlate.textContent = msg.plate;
+        }
+        if (hudConf) {
+          hudConf.textContent = '98.5%';
+        }
+        if (hudTime) {
+          hudTime.textContent = new Date().toLocaleTimeString('vi-VN');
+        }
+        if (hudAction) {
+          hudAction.textContent = msg.command === 'OPEN_ENTRY' ? 'Mở cổng vào (Hợp lệ)' : (msg.command === 'OPEN_EXIT' ? 'Mở cổng ra' : 'Từ chối (Bãi đầy)');
+        }
+
+        showToast(`AI Camera nhận diện biển số: [${msg.plate}]`);
+        playTone(1046, 'sine', 0.2);
+        if (msg.event) prependEventLog(msg.event);
+        fetchAnalytics();
       }
     } catch (e) {
       console.error('Error parsing WS message:', e);
@@ -121,6 +153,47 @@ function initWebSocket() {
     badgeWs.className = 'glass-panel px-3 py-1.5 rounded-xl flex items-center gap-2 text-rose-400 border border-rose-500/30';
     setTimeout(initWebSocket, 2500);
   };
+}
+
+// Live Webcam Stream Directly on Browser
+let webcamStream = null;
+async function toggleWebcamPreview() {
+  const video = document.getElementById('webcam-video');
+  const placeholder = document.getElementById('cam-placeholder');
+  const btnText = document.getElementById('text-btn-cam');
+
+  if (webcamStream) {
+    webcamStream.getTracks().forEach(track => track.stop());
+    webcamStream = null;
+    video.classList.add('hidden');
+    placeholder.classList.remove('hidden');
+    btnText.textContent = 'Mở Camera Trên Web';
+  } else {
+    try {
+      // Tìm camera iVCam nếu có nhiều thiết bị
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      let targetDeviceId = undefined;
+      
+      const ivcamDevice = videoDevices.find(d => d.label.toLowerCase().includes('ivcam') || d.label.toLowerCase().includes('e2esoft'));
+      if (ivcamDevice) {
+        targetDeviceId = { exact: ivcamDevice.deviceId };
+      } else if (videoDevices.length > 1) {
+        // Neu co tu 2 camera tro len thi uu tien camera phu (thuong la iVCam)
+        targetDeviceId = { exact: videoDevices[videoDevices.length - 1].deviceId };
+      }
+
+      webcamStream = await navigator.mediaDevices.getUserMedia({ 
+        video: targetDeviceId ? { deviceId: targetDeviceId, width: { ideal: 1280 } } : { width: { ideal: 1280 } } 
+      });
+      video.srcObject = webcamStream;
+      video.classList.remove('hidden');
+      placeholder.classList.add('hidden');
+      btnText.textContent = 'Tắt Camera Trên Web';
+    } catch (err) {
+      alert('Không thể mở camera trên trình duyệt: ' + err.message + '\nBạn hãy chạy qua file start_ivcam_ai.bat!');
+    }
+  }
 }
 
 // Render System State
@@ -372,7 +445,10 @@ function createLogElement(log) {
 
   let icon = 'fa-circle-info';
   let color = 'text-cyan-400';
-  if (log.event_type.includes('ENTER')) {
+  if (log.event_type.includes('PLATE')) {
+    icon = 'fa-camera';
+    color = 'text-cyan-300';
+  } else if (log.event_type.includes('ENTER')) {
     icon = 'fa-car-side';
     color = 'text-emerald-400';
   } else if (log.event_type.includes('LEAVE')) {

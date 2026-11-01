@@ -41,7 +41,7 @@ constexpr uint8_t PIN_ENTRY_SENSOR = 35;
 constexpr uint8_t PIN_EXIT_SENSOR  = 36;
 constexpr uint8_t PIN_ENTRY_SERVO  = 25;
 constexpr uint8_t PIN_EXIT_SERVO   = 26;
-constexpr uint8_t PIN_BUZZER       = 27;
+constexpr uint8_t PIN_BUZZER       = 27;  
 constexpr uint8_t PIN_OLED_SDA     = 21;
 constexpr uint8_t PIN_OLED_SCL     = 22;
 

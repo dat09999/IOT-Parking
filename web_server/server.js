@@ -99,6 +99,7 @@ db.serialize(() => {
     event_type TEXT NOT NULL,
     slot TEXT,
     description TEXT NOT NULL,
+    license_plate TEXT,
     p1 INTEGER,
     p2 INTEGER,
     p3 INTEGER,
@@ -284,6 +285,64 @@ app.post('/api/parking/data', verifyDeviceAuth, (req, res) => {
       command: commandToSend
     });
   });
+});
+
+// 1.1 ALPR Endpoint: Nhan bien so xe tu Python Camera AI
+app.post('/api/parking/alpr', verifyDeviceAuth, (req, res) => {
+  const { plate, gate, confidence } = req.body;
+  if (!plate) {
+    return res.status(400).json({ status: 'error', message: 'Bien so xe (plate) la bat buoc' });
+  }
+
+  const gateType = gate === 'exit' ? 'EXIT' : 'ENTRY';
+  const desc = gateType === 'ENTRY' 
+    ? `Xe nhận diện: [${plate}] đến cổng vào (Độ tin cậy: ${confidence ? Math.round(confidence * 100) : 95}%)`
+    : `Xe nhận diện: [${plate}] đến cổng ra (Độ tin cậy: ${confidence ? Math.round(confidence * 100) : 95}%)`;
+
+  // Tu dong phat lenh mo cong tuong ung neu con cho
+  let commandDispatched = null;
+  if (gateType === 'ENTRY') {
+    if (currentState.freeSlots > 0) {
+      commandDispatched = 'OPEN_ENTRY';
+      db.run(`INSERT INTO pending_commands (command, param) VALUES (?, ?)`, ['OPEN_ENTRY', plate]);
+    }
+  } else {
+    commandDispatched = 'OPEN_EXIT';
+    db.run(`INSERT INTO pending_commands (command, param) VALUES (?, ?)`, ['OPEN_EXIT', plate]);
+  }
+
+  // Luu vao CSDL
+  db.run(
+    `INSERT INTO parking_events (event_type, slot, description, license_plate, p1, p2, p3, free_slots) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [`PLATE_${gateType}`, gateType === 'ENTRY' ? 'GATE_IN' : 'GATE_OUT', desc, plate, currentState.p1, currentState.p2, currentState.p3, currentState.freeSlots],
+    function(err) {
+      const eventObj = {
+        id: this ? this.lastID : Date.now(),
+        event_type: `PLATE_${gateType}`,
+        slot: gateType === 'ENTRY' ? 'GATE_IN' : 'GATE_OUT',
+        description: desc,
+        license_plate: plate,
+        created_at: new Date().toISOString()
+      };
+
+      // Broadcast qua WebSocket len giao dien Web
+      broadcastToClients({
+        type: 'new_plate_detected',
+        plate,
+        gate: gateType,
+        command: commandDispatched,
+        event: eventObj
+      });
+
+      res.json({
+        status: 'success',
+        plate,
+        gate: gateType,
+        action: commandDispatched ? `Mo barie ${gateType}` : 'Bai day, tu choi',
+        freeSlots: currentState.freeSlots
+      });
+    }
+  );
 });
 
 // 2. Get current status
