@@ -4,12 +4,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 import urllib.request
 import urllib.error
 
 import cv2
 from fast_alpr import ALPR
+
+# Hàm gửi dữ liệu bất đồng bộ chạy ngầm (Non-blocking Thread) để camera mượt 60fps không bị lag
+def post_to_cloud_async(url: str, payload_data: dict):
+    def _worker():
+        try:
+            payload = json.dumps(payload_data).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-Key": "IOT_SECURE_TOKEN_2026",
+                    "User-Agent": "FastALPR_Camera_Node/1.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                print(f" -> [Cloud Response] {res_data.get('action', 'OK')}")
+        except Exception as err:
+            print(f" -> [Cloud Error] {err}")
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
 
 def parse_source(value: str) -> int | str:
@@ -102,32 +127,15 @@ def main() -> int:
                     )
                     if text and text != "Unreadable":
                         now = time.monotonic()
-                        if now - last_printed.get(text, 0) >= 3:
-                            print(f"[ALPR] Phat hien bien so: {text} (Do tin cay: {score:.2f})")
+                        if now - last_printed.get(text, 0) >= 1.5:
+                            print(f"[ALPR Chớp Nhoáng] Nhận diện biển số: {text} (Độ tin cậy: {score:.2f})")
                             last_printed[text] = now
-                            # Gui du lieu len Cloud Web Server
                             if args.cloud_url:
-                                try:
-                                    payload = json.dumps({
-                                        "plate": text,
-                                        "gate": args.gate,
-                                        "confidence": float(score)
-                                    }).encode("utf-8")
-                                    req = urllib.request.Request(
-                                        args.cloud_url,
-                                        data=payload,
-                                        headers={
-                                            "Content-Type": "application/json",
-                                            "X-API-Key": "IOT_SECURE_TOKEN_2026",
-                                            "User-Agent": "FastALPR_Camera_Node/1.0"
-                                        },
-                                        method="POST"
-                                    )
-                                    with urllib.request.urlopen(req, timeout=3) as resp:
-                                        res_data = json.loads(resp.read().decode("utf-8"))
-                                        print(f" -> [Cloud Response] {res_data.get('action', 'OK')}")
-                                except Exception as err:
-                                    print(f" -> [Cloud Error] Khong the gui lenh: {err}")
+                                post_to_cloud_async(args.cloud_url, {
+                                    "plate": text,
+                                    "gate": args.gate,
+                                    "confidence": float(score)
+                                })
 
             cv2.imshow("Pretrained ALPR - press Q to quit", frame)
             if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
