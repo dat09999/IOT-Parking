@@ -10,8 +10,8 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const HTTP_PORT = 3000;
-const MQTT_PORT = 1883;
+const HTTP_PORT = process.env.PORT || 3000;
+const MQTT_PORT = process.env.MQTT_PORT || 1883;
 const IOT_API_KEY = process.env.IOT_API_KEY || "IOT_SECURE_TOKEN_2026";
 
 // ================= SECURITY LAYER ================= //
