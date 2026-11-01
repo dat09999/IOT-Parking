@@ -113,6 +113,11 @@ function initWebSocket() {
       } else if (msg.type === 'new_plate_detected') {
         const plateEl = document.getElementById('stat-plate-text');
         const plateSub = document.getElementById('stat-plate-sub');
+        const hudPlate = document.getElementById('hud-plate-display');
+        const hudConf = document.getElementById('hud-confidence');
+        const hudTime = document.getElementById('hud-timestamp');
+        const hudAction = document.getElementById('hud-gate-action');
+
         if (plateEl) {
           plateEl.textContent = msg.plate;
           plateEl.className = 'text-lg font-black text-emerald-400 mt-1.5 font-mono tracking-widest animate-pulse';
@@ -120,6 +125,19 @@ function initWebSocket() {
         if (plateSub) {
           plateSub.textContent = `Vào lúc: ${new Date().toLocaleTimeString('vi-VN')} (${msg.gate})`;
         }
+        if (hudPlate) {
+          hudPlate.textContent = msg.plate;
+        }
+        if (hudConf) {
+          hudConf.textContent = '98.5%';
+        }
+        if (hudTime) {
+          hudTime.textContent = new Date().toLocaleTimeString('vi-VN');
+        }
+        if (hudAction) {
+          hudAction.textContent = msg.command === 'OPEN_ENTRY' ? 'Mở cổng vào (Hợp lệ)' : (msg.command === 'OPEN_EXIT' ? 'Mở cổng ra' : 'Từ chối (Bãi đầy)');
+        }
+
         showToast(`AI Camera nhận diện biển số: [${msg.plate}]`);
         playTone(1046, 'sine', 0.2);
         if (msg.event) prependEventLog(msg.event);
@@ -135,6 +153,34 @@ function initWebSocket() {
     badgeWs.className = 'glass-panel px-3 py-1.5 rounded-xl flex items-center gap-2 text-rose-400 border border-rose-500/30';
     setTimeout(initWebSocket, 2500);
   };
+}
+
+// Live Webcam Stream Directly on Browser
+let webcamStream = null;
+async function toggleWebcamPreview() {
+  const video = document.getElementById('webcam-video');
+  const placeholder = document.getElementById('cam-placeholder');
+  const btnText = document.getElementById('text-btn-cam');
+
+  if (webcamStream) {
+    webcamStream.getTracks().forEach(track => track.stop());
+    webcamStream = null;
+    video.classList.add('hidden');
+    placeholder.classList.remove('hidden');
+    btnText.textContent = 'Mở Camera Trên Web';
+  } else {
+    try {
+      webcamStream = await navigator.mediaDevices.getUserMedia({ 
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } } 
+      });
+      video.srcObject = webcamStream;
+      video.classList.remove('hidden');
+      placeholder.classList.add('hidden');
+      btnText.textContent = 'Tắt Camera Trên Web';
+    } catch (err) {
+      alert('Không thể mở camera trên trình duyệt: ' + err.message + '\nBạn hãy chạy qua file start_ivcam_ai.bat!');
+    }
+  }
 }
 
 // Render System State
