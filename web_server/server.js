@@ -100,12 +100,34 @@ db.serialize(() => {
     slot TEXT,
     description TEXT NOT NULL,
     license_plate TEXT,
+    status_decision TEXT DEFAULT 'VALID',
     p1 INTEGER,
     p2 INTEGER,
     p3 INTEGER,
     free_slots INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // Bảng danh sách biển số xe hợp lệ đăng ký trước (Whitelist Database)
+  db.run(`CREATE TABLE IF NOT EXISTS registered_vehicles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plate TEXT UNIQUE NOT NULL,
+    owner_name TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // Thêm sẵn các biển số mẫu để test (bao gồm biển 36C-925.64 của bạn)
+  const defaultPlates = [
+    ['36C-925.64', 'Xe Giám Đốc'],
+    ['36A-483.27', 'Xe Cán Bộ'],
+    ['36B-716.39', 'Xe Nhân Viên'],
+    ['36D-358.41', 'Xe Khách VIP'],
+    ['30A-999.99', 'Xe Ưu Tiên']
+  ];
+  defaultPlates.forEach(([p, owner]) => {
+    db.run(`INSERT OR IGNORE INTO registered_vehicles (plate, owner_name) VALUES (?, ?)`, [p, owner]);
+  });
 
   // Commands Queue (for ESP32 REST polling if not using MQTT)
   db.run(`CREATE TABLE IF NOT EXISTS pending_commands (
@@ -287,62 +309,84 @@ app.post('/api/parking/data', verifyDeviceAuth, (req, res) => {
   });
 });
 
-// 1.1 ALPR Endpoint: Nhan bien so xe tu Python Camera AI
+// 1.1 ALPR Endpoint: Đối chiếu CSDL & Ra quyết định mở cổng
 app.post('/api/parking/alpr', verifyDeviceAuth, (req, res) => {
   const { plate, gate, confidence } = req.body;
   if (!plate) {
     return res.status(400).json({ status: 'error', message: 'Bien so xe (plate) la bat buoc' });
   }
 
+  // Chuẩn hóa biển số (bỏ dấu cách, dấu gạch nối để đối chiếu linh hoạt)
+  const normalizedPlate = plate.replace(/[^A-Z0-9]/gi, '').toUpperCase();
   const gateType = gate === 'exit' ? 'EXIT' : 'ENTRY';
-  const desc = gateType === 'ENTRY' 
-    ? `Xe nhận diện: [${plate}] đến cổng vào (Độ tin cậy: ${confidence ? Math.round(confidence * 100) : 95}%)`
-    : `Xe nhận diện: [${plate}] đến cổng ra (Độ tin cậy: ${confidence ? Math.round(confidence * 100) : 95}%)`;
 
-  // Tu dong phat lenh mo cong tuong ung neu con cho
-  let commandDispatched = null;
-  if (gateType === 'ENTRY') {
-    if (currentState.freeSlots > 0) {
-      commandDispatched = 'OPEN_ENTRY';
-      db.run(`INSERT INTO pending_commands (command, param) VALUES (?, ?)`, ['OPEN_ENTRY', plate]);
+  // Bước 5: Đối chiếu với cơ sở dữ liệu biển số đã đăng ký
+  db.get(`SELECT * FROM registered_vehicles WHERE REPLACE(REPLACE(plate, '-', ''), '.', '') = ? AND is_active = 1`, [normalizedPlate], (err, vehicle) => {
+    let isValid = !!vehicle;
+    let decision = 'INVALID';
+    let commandDispatched = null;
+    let desc = '';
+
+    // Bước 6: Ra quyết định
+    if (isValid) {
+      if (gateType === 'ENTRY') {
+        if (currentState.freeSlots > 0) {
+          decision = 'VALID';
+          commandDispatched = 'OPEN_ENTRY';
+          desc = `[HỢP LỆ] Xe ${vehicle.owner_name} (${plate}) được phép vào bãi. Gửi lệnh mở barie.`;
+          db.run(`INSERT INTO pending_commands (command, param) VALUES (?, ?)`, ['OPEN_ENTRY', plate]);
+        } else {
+          decision = 'PARKING_FULL';
+          desc = `[TỪ CHỐI] Xe ${vehicle.owner_name} (${plate}) hợp lệ nhưng bãi xe đã đầy chỗ!`;
+        }
+      } else {
+        decision = 'VALID';
+        commandDispatched = 'OPEN_EXIT';
+        desc = `[HỢP LỆ] Xe ${vehicle.owner_name} (${plate}) rời bãi. Gửi lệnh mở barie lối ra.`;
+        db.run(`INSERT INTO pending_commands (command, param) VALUES (?, ?)`, ['OPEN_EXIT', plate]);
+      }
+    } else {
+      decision = 'INVALID';
+      desc = `[KHÔNG HỢP LỆ] Biển số [${plate}] chưa đăng ký trong hệ thống! Giữ đóng cổng để người quản lý xử lý.`;
     }
-  } else {
-    commandDispatched = 'OPEN_EXIT';
-    db.run(`INSERT INTO pending_commands (command, param) VALUES (?, ?)`, ['OPEN_EXIT', plate]);
-  }
 
-  // Luu vao CSDL
-  db.run(
-    `INSERT INTO parking_events (event_type, slot, description, license_plate, p1, p2, p3, free_slots) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [`PLATE_${gateType}`, gateType === 'ENTRY' ? 'GATE_IN' : 'GATE_OUT', desc, plate, currentState.p1, currentState.p2, currentState.p3, currentState.freeSlots],
-    function(err) {
-      const eventObj = {
-        id: this ? this.lastID : Date.now(),
-        event_type: `PLATE_${gateType}`,
-        slot: gateType === 'ENTRY' ? 'GATE_IN' : 'GATE_OUT',
-        description: desc,
-        license_plate: plate,
-        created_at: new Date().toISOString()
-      };
+    // Bước 7: Ghi nhận lượt xe vào lịch sử CSDL
+    db.run(
+      `INSERT INTO parking_events (event_type, slot, description, license_plate, status_decision, p1, p2, p3, free_slots) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`PLATE_${gateType}`, gateType === 'ENTRY' ? 'GATE_IN' : 'GATE_OUT', desc, plate, decision, currentState.p1, currentState.p2, currentState.p3, currentState.freeSlots],
+      function(err) {
+        const eventObj = {
+          id: this ? this.lastID : Date.now(),
+          event_type: `PLATE_${gateType}`,
+          slot: gateType === 'ENTRY' ? 'GATE_IN' : 'GATE_OUT',
+          description: desc,
+          license_plate: plate,
+          status_decision: decision,
+          created_at: new Date().toISOString()
+        };
 
-      // Broadcast qua WebSocket len giao dien Web
-      broadcastToClients({
-        type: 'new_plate_detected',
-        plate,
-        gate: gateType,
-        command: commandDispatched,
-        event: eventObj
-      });
+        // Broadcast thời gian thực lên Website
+        broadcastToClients({
+          type: 'new_plate_detected',
+          plate,
+          gate: gateType,
+          decision,
+          owner: vehicle ? vehicle.owner_name : 'Chưa đăng ký',
+          command: commandDispatched,
+          event: eventObj
+        });
 
-      res.json({
-        status: 'success',
-        plate,
-        gate: gateType,
-        action: commandDispatched ? `Mo barie ${gateType}` : 'Bai day, tu choi',
-        freeSlots: currentState.freeSlots
-      });
-    }
-  );
+        res.json({
+          status: 'success',
+          plate,
+          decision,
+          owner: vehicle ? vehicle.owner_name : null,
+          action: commandDispatched ? `Mo barie ${gateType}` : 'Giu nguyen cong dong',
+          freeSlots: currentState.freeSlots
+        });
+      }
+    );
+  });
 });
 
 // 2. Get current status

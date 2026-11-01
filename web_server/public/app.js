@@ -118,28 +118,50 @@ function initWebSocket() {
         const hudTime = document.getElementById('hud-timestamp');
         const hudAction = document.getElementById('hud-gate-action');
 
+        const isValid = msg.decision === 'VALID';
+        const isFull = msg.decision === 'PARKING_FULL';
+
         if (plateEl) {
           plateEl.textContent = msg.plate;
-          plateEl.className = 'text-lg font-black text-emerald-400 mt-1.5 font-mono tracking-widest animate-pulse';
+          plateEl.className = isValid 
+            ? 'text-lg font-black text-emerald-400 mt-1.5 font-mono tracking-widest animate-pulse'
+            : 'text-lg font-black text-rose-400 mt-1.5 font-mono tracking-widest animate-pulse';
         }
         if (plateSub) {
-          plateSub.textContent = `Vào lúc: ${new Date().toLocaleTimeString('vi-VN')} (${msg.gate})`;
+          plateSub.textContent = `${msg.owner || 'Chưa đăng ký'} (${msg.gate})`;
         }
         if (hudPlate) {
           hudPlate.textContent = msg.plate;
+          hudPlate.className = isValid
+            ? 'bg-emerald-400 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-emerald-400/20 border-2 border-emerald-300'
+            : 'bg-rose-500 text-white px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-rose-500/20 border-2 border-rose-400';
         }
         if (hudConf) {
-          hudConf.textContent = '98.5%';
+          hudConf.textContent = isValid ? `HỢP LỆ (${msg.owner})` : 'KHÔNG HỢP LỆ';
+          hudConf.className = isValid ? 'font-mono text-emerald-400 font-bold' : 'font-mono text-rose-400 font-bold';
         }
         if (hudTime) {
           hudTime.textContent = new Date().toLocaleTimeString('vi-VN');
         }
         if (hudAction) {
-          hudAction.textContent = msg.command === 'OPEN_ENTRY' ? 'Mở cổng vào (Hợp lệ)' : (msg.command === 'OPEN_EXIT' ? 'Mở cổng ra' : 'Từ chối (Bãi đầy)');
+          if (isValid) {
+            hudAction.textContent = msg.gate === 'ENTRY' ? 'Mở cổng vào (Barie nâng)' : 'Mở cổng ra (Barie nâng)';
+            hudAction.className = 'font-semibold text-emerald-400';
+            playTone(1046, 'sine', 0.2);
+            showToast(`[HỢP LỆ] ${msg.plate} - ${msg.owner} -> Mở Barie`);
+          } else if (isFull) {
+            hudAction.textContent = 'Từ chối: Bãi xe đầy!';
+            hudAction.className = 'font-semibold text-amber-400';
+            playTone(500, 'square', 0.3);
+            showToast(`[TỪ CHỐI] Bãi xe đã đầy chỗ!`);
+          } else {
+            hudAction.textContent = 'Cổng đóng: Biển số chưa đăng ký!';
+            hudAction.className = 'font-semibold text-rose-400';
+            playTone(400, 'sawtooth', 0.4);
+            showToast(`[CẢNH BÁO] Biển số [${msg.plate}] không hợp lệ!`);
+          }
         }
 
-        showToast(`AI Camera nhận diện biển số: [${msg.plate}]`);
-        playTone(1046, 'sine', 0.2);
         if (msg.event) prependEventLog(msg.event);
         fetchAnalytics();
       }
