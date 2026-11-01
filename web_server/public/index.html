@@ -236,6 +236,10 @@
           <i class="fa-solid fa-door-closed text-base text-rose-400"></i>
           <span>Cổng Ra: <b id="sim-label-exit" class="text-slate-400">ĐÓNG</b></span>
         </button>
+        <button onclick="toggleSimVehicleEntry()" id="btn-sim-vehicle-entry" class="py-2.5 px-3 rounded-2xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700/80 text-xs font-medium text-slate-200 flex flex-col items-center gap-1.5 transition">
+          <i class="fa-solid fa-car-side text-base text-amber-300"></i>
+          <span>Cảm Biến Vào: <b id="sim-label-vehicle" class="text-slate-400">CHỜ XE</b></span>
+        </button>
       </div>
     </div>
 
@@ -479,6 +483,10 @@
             <i class="fa-solid fa-camera"></i>
             <span id="text-btn-cam">Bật Camera</span>
           </button>
+          <button onclick="manualTriggerScan()" id="btn-manual-scan" class="btn-neon px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-emerald-500 hover:from-amber-400 hover:to-emerald-400 text-slate-950 font-bold flex items-center gap-1.5 shadow-lg shadow-emerald-500/20 transition">
+            <i class="fa-solid fa-bolt"></i>
+            <span id="text-btn-scan">⚡ Quét Thử Ngay</span>
+          </button>
         </div>
       </div>
 
@@ -504,6 +512,13 @@
               <div class="w-6 h-6 border-b-2 border-l-2 border-cyan-400"></div>
               <div class="w-6 h-6 border-b-2 border-r-2 border-cyan-400"></div>
             </div>
+          </div>
+
+          <!-- Target Viewfinder Box for License Plate Crop (Lấy đúng biển số xe, bỏ chữ rác màn hình) -->
+          <div id="hud-target-box" class="absolute inset-x-[15%] inset-y-[20%] border-2 border-dashed border-cyan-400/70 rounded-2xl pointer-events-none flex flex-col items-center justify-between p-2.5 transition-all duration-300">
+            <span class="text-[10px] text-cyan-300 font-mono tracking-widest bg-slate-950/80 px-2 py-0.5 rounded uppercase border border-cyan-500/40 shadow">Khung ngắm nhận diện biển số</span>
+            <div id="hud-laser-line" class="w-full h-0.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent opacity-0 transition-opacity duration-200"></div>
+            <span id="hud-target-hint" class="text-[9px] text-slate-300 font-mono bg-slate-950/70 px-2 py-0.5 rounded">Căn biển số xe vào giữa khung này</span>
           </div>
         </div>
 

@@ -148,6 +148,7 @@ let currentState = {
   exitGate: 0,
   freeSlots: 3,
   parkingFull: 0,
+  vehicleAtEntry: 0,
   lastUpdated: new Date().toISOString(),
   deviceOnline: false,
   lastHeartbeat: 0
@@ -179,6 +180,7 @@ function processTelemetryUpdate(data, source = 'REST') {
   const p3 = data.p3 ? 1 : 0;
   const entryGate = data.entryGate ? 1 : 0;
   const exitGate = data.exitGate ? 1 : 0;
+  const vehicleAtEntry = (data.vehicleAtEntry === 1 || data.vehicleAtEntry === true || data.vehicleAtEntry === '1') ? 1 : 0;
   const occupiedCount = p1 + p2 + p3;
   const freeSlots = 3 - occupiedCount;
   const parkingFull = (freeSlots === 0) ? 1 : 0;
@@ -186,6 +188,16 @@ function processTelemetryUpdate(data, source = 'REST') {
   // Detect state transitions to log meaningful events
   const prev = currentState;
   const events = [];
+
+  if (vehicleAtEntry !== prev.vehicleAtEntry) {
+    if (vehicleAtEntry) {
+      events.push({
+        type: 'VEHICLE_APPROACH_ENTRY',
+        slot: 'GATE_IN',
+        desc: 'Cảm biến IR cổng vào phát hiện xe đến. Kích hoạt camera AI quét biển số.'
+      });
+    }
+  }
 
   if (p1 !== prev.p1) {
     events.push({
@@ -232,6 +244,7 @@ function processTelemetryUpdate(data, source = 'REST') {
     exitGate,
     freeSlots,
     parkingFull,
+    vehicleAtEntry,
     lastUpdated: new Date().toISOString(),
     deviceOnline: true,
     lastHeartbeat: Date.now()
@@ -288,7 +301,8 @@ app.post('/api/parking/data', verifyDeviceAuth, (req, res) => {
     p2: (data.p2 === 1 || data.p2 === true || data.p2 === '1') ? 1 : 0,
     p3: (data.p3 === 1 || data.p3 === true || data.p3 === '1') ? 1 : 0,
     entryGate: (data.entryGate === 1 || data.entryGate === true || data.entryGate === '1') ? 1 : 0,
-    exitGate: (data.exitGate === 1 || data.exitGate === true || data.exitGate === '1') ? 1 : 0
+    exitGate: (data.exitGate === 1 || data.exitGate === true || data.exitGate === '1') ? 1 : 0,
+    vehicleAtEntry: (data.vehicleAtEntry === 1 || data.vehicleAtEntry === true || data.vehicleAtEntry === '1') ? 1 : 0
   };
 
   processTelemetryUpdate(cleanData, 'REST_API');

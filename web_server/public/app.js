@@ -180,6 +180,36 @@ function initWebSocket() {
 // Live Webcam Stream Directly on Browser
 let webcamStream = null;
 let currentCameraId = null;
+let tesseractWorker = null;
+let isWorkerReady = false;
+let isWorkerLoading = false;
+let currentVehicleAtEntry = 0;
+let isProcessingRecognition = false;
+let lastRecognizedPlate = '';
+let lastRecognizedTime = 0;
+
+// Khởi tạo Tesseract OCR Worker chạy ngầm siêu tốc ngay từ khi mở trang (Preload into RAM)
+async function initTesseractWorker() {
+  if (tesseractWorker || isWorkerLoading) return;
+  isWorkerLoading = true;
+  try {
+    if (window.Tesseract) {
+      tesseractWorker = await Tesseract.createWorker('eng', 1, {
+        logger: () => {} // Tắt log ngầm để tối ưu hiệu năng
+      });
+      await tesseractWorker.setParameters({
+        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-',
+        tessedit_pageseg_mode: '7' // PSM 7: SINGLE_LINE (Cực kỳ nhanh và chuẩn cho biển số 1 dòng)
+      });
+      isWorkerReady = true;
+      console.log('⚡ [AI ALPR] Tesseract OCR Worker đã nạp sẵn vào RAM, sẵn sàng nhận diện tức thì!');
+    }
+  } catch (err) {
+    console.warn('⚠️ Chưa nạp được Tesseract Worker:', err);
+  } finally {
+    isWorkerLoading = false;
+  }
+}
 
 async function populateCameraList() {
   const select = document.getElementById('camera-select');
@@ -199,7 +229,6 @@ async function populateCameraList() {
       const opt = document.createElement('option');
       opt.value = device.deviceId;
       opt.text = device.label || `Camera ${idx + 1}`;
-      // Tự động ưu tiên chọn iVCam hoặc camera ngoài
       if (opt.text.toLowerCase().includes('ivcam') || opt.text.toLowerCase().includes('e2esoft')) {
         defaultIndex = idx;
       }
@@ -217,7 +246,6 @@ async function changeCameraSource() {
   const select = document.getElementById('camera-select');
   currentCameraId = select.value;
   if (webcamStream) {
-    // Nếu đang bật camera thì khởi động lại với camera mới
     webcamStream.getTracks().forEach(track => track.stop());
     webcamStream = null;
     startCameraStream();
@@ -237,7 +265,8 @@ async function startCameraStream() {
     video.classList.remove('hidden');
     placeholder.classList.add('hidden');
     btnText.textContent = 'Tắt Camera';
-    populateCameraList(); // Cập nhật tên nhãn sau khi đã cấp quyền
+    populateCameraList();
+    initTesseractWorker(); // Đảm bảo worker sẵn sàng
   } catch (err) {
     alert('Không thể mở camera: ' + err.message);
   }
@@ -249,7 +278,6 @@ async function toggleWebcamPreview() {
   const btnText = document.getElementById('text-btn-cam');
 
   if (webcamStream) {
-    stopAutoScanLoop();
     webcamStream.getTracks().forEach(track => track.stop());
     webcamStream = null;
     video.classList.add('hidden');
@@ -257,87 +285,312 @@ async function toggleWebcamPreview() {
     btnText.textContent = 'Bật Camera';
   } else {
     await startCameraStream();
-    startAutoScanLoop();
   }
 }
 
-// Client-Side Real-time Optical Character Recognition (OCR) Engine
-let autoScanInterval = null;
-let isScanning = false;
+// ================= THUẬT TOÁN ĐÁNH GIÁ ĐỘ NÉT & TIỀN XỬ LÝ ẢNH (BURST CAPTURE) =================
 
-function startAutoScanLoop() {
-  if (autoScanInterval) clearInterval(autoScanInterval);
-  // Tu dong quet dinh ky moi 2.5 giay
-  autoScanInterval = setInterval(() => {
-    if (webcamStream && !isScanning) {
-      scanLicensePlateNow(false);
+// Hàm đo độ sắc nét của ảnh (Laplacian / Edge gradient contrast)
+function evaluateSharpness(imageData) {
+  const data = imageData.data;
+  const w = imageData.width;
+  const h = imageData.height;
+  let totalDiff = 0;
+  let count = 0;
+
+  for (let y = 1; y < h - 1; y += 2) {
+    for (let x = 1; x < w - 1; x += 2) {
+      const idx = (y * w + x) * 4;
+      const g = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+      const gR = 0.299 * data[idx + 4] + 0.587 * data[idx + 5] + 0.114 * data[idx + 6];
+      const gD = 0.299 * data[idx + w * 4] + 0.587 * data[idx + w * 4 + 1] + 0.114 * data[idx + w * 4 + 2];
+      totalDiff += Math.abs(g - gR) + Math.abs(g - gD);
+      count++;
     }
-  }, 2500);
-}
-
-function stopAutoScanLoop() {
-  if (autoScanInterval) {
-    clearInterval(autoScanInterval);
-    autoScanInterval = null;
   }
+  return count > 0 ? (totalDiff / count) : 0;
 }
 
-async function scanLicensePlateNow(manual = true) {
+// Cắt đúng vùng khung ngắm trung tâm (bỏ chữ rác xung quanh), tiền xử lý nhị phân hóa siêu nét
+function prepareOptimizedCrop(video, targetCanvas) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+
+  // Khung ngắm trung tâm tương ứng với HUD: sx 15%, sy 20%, sw 70%, sh 60%
+  const sx = Math.floor(vw * 0.15);
+  const sy = Math.floor(vh * 0.20);
+  const sw = Math.floor(vw * 0.70);
+  const sh = Math.floor(vh * 0.60);
+
+  // Resize về kích thước chuẩn tối ưu cho OCR (chiều cao 110px -> OCR chạy trong 100ms)
+  const targetH = 110;
+  const targetW = Math.round((sw / sh) * targetH);
+
+  targetCanvas.width = targetW;
+  targetCanvas.height = targetH;
+  const ctx = targetCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH);
+
+  const imgData = ctx.getImageData(0, 0, targetW, targetH);
+  const d = imgData.data;
+
+  // Tự động phân tích độ tương phản (Auto-Contrast Stretching)
+  let minLum = 255, maxLum = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    if (lum < minLum) minLum = lum;
+    if (lum > maxLum) maxLum = lum;
+  }
+  const range = Math.max(maxLum - minLum, 1);
+  const threshold = minLum + range * 0.50; // Ngưỡng tách ký tự đen và nền trắng
+
+  // Nhị phân hóa đen - trắng (Binarization)
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    const val = (lum < threshold) ? 0 : 255;
+    d[i] = val;
+    d[i + 1] = val;
+    d[i + 2] = val;
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return { canvas: targetCanvas, imgData };
+}
+
+// Chuẩn hóa và làm sạch chuỗi biển số nhận diện
+function cleanAndFormatPlate(rawText) {
+  if (!rawText) return null;
+  // Bỏ khoảng trắng và ký tự đặc biệt
+  let s = rawText.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  
+  // Tự động sửa các lỗi OCR thường gặp
+  // 1. Chữ O ở 2 ký tự đầu (mã tỉnh) thành số 0 (hoặc nếu là 36C thì giữ nguyên)
+  // 2. Tìm mẫu biển số Việt Nam: 2 số đầu + 1 hoặc 2 chữ series + 4 đến 5 số đuôi
+  const match = s.match(/([0-9]{2}[A-Z]{1,2}[0-9]{4,5})/);
+  if (match) {
+    const p = match[0];
+    const prov = p.slice(0, 2);
+    let series = '';
+    let numPart = '';
+    if (isNaN(p[2]) && isNaN(p[3])) {
+      series = p.slice(2, 4);
+      numPart = p.slice(4);
+    } else {
+      series = p.slice(2, 3);
+      numPart = p.slice(3);
+    }
+    if (numPart.length === 5) {
+      return `${prov}${series}-${numPart.slice(0, 3)}.${numPart.slice(3)}`;
+    } else {
+      return `${prov}${series}-${numPart}`;
+    }
+  }
+  
+  // Trường hợp có dấu gạch ngang sẵn
+  const altMatch = rawText.match(/([0-9]{2}[A-Z]{1,2}[-.\s]?[0-9]{3,5}[.]?[0-9]{0,2})/i);
+  if (altMatch && altMatch[0].length >= 6) {
+    return altMatch[0].toUpperCase().replace(/\s+/g, '');
+  }
+  return null;
+}
+
+// ================= HÀM KÍCH HOẠT NHẬN DIỆN BIỂN SỐ SIÊU TỐC (BURST MODE 2-3 FRAME) =================
+async function triggerBurstRecognition(isManual = false) {
   const video = document.getElementById('webcam-video');
   const canvas = document.getElementById('webcam-canvas');
   const hudPlate = document.getElementById('hud-plate-display');
+  const hudConf = document.getElementById('hud-confidence');
+  const hudTime = document.getElementById('hud-timestamp');
+  const hudAction = document.getElementById('hud-gate-action');
   const btnScan = document.getElementById('text-btn-scan');
+  const laser = document.getElementById('hud-laser-line');
 
   if (!video || !webcamStream || video.videoWidth === 0) {
-    if (manual) alert('Vui lòng bật Camera trước khi quét biển số!');
+    if (isManual) alert('Vui lòng bấm "Bật Camera" trước khi quét!');
     return;
   }
 
-  if (isScanning) return;
-  isScanning = true;
+  if (isProcessingRecognition) return;
+  isProcessingRecognition = true;
 
-  if (manual && btnScan) btnScan.textContent = 'Đang nhận diện...';
+  if (laser) laser.classList.remove('opacity-0');
+  if (btnScan) btnScan.textContent = '⚡ Đang quét...';
+  if (hudPlate) {
+    hudPlate.textContent = 'ĐANG QUÉT BIỂN SỐ...';
+    hudPlate.className = 'bg-cyan-500 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-cyan-500/30 border-2 border-cyan-300 animate-pulse';
+  }
+  if (hudAction) {
+    hudAction.textContent = 'Đang nhận diện AI siêu tốc...';
+    hudAction.className = 'font-semibold text-cyan-400';
+  }
+
+  const startTime = performance.now();
 
   try {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (!tesseractWorker) {
+      await initTesseractWorker();
+    }
 
-    // Chay OCR qua Tesseract truc tiep tren trinh duyet
-    if (window.Tesseract) {
-      const result = await Tesseract.recognize(canvas, 'eng', {
-        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-'
+    // Chụp liên tiếp 3 ảnh (cách nhau 40ms) và chọn ảnh có độ sắc nét tốt nhất
+    const burstCandidates = [];
+    for (let i = 0; i < 3; i++) {
+      const tempCanv = document.createElement('canvas');
+      const crop = prepareOptimizedCrop(video, tempCanv);
+      if (crop) {
+        const sharpness = evaluateSharpness(crop.imgData);
+        burstCandidates.push({ canvas: tempCanv, sharpness });
+      }
+      if (i < 2) await new Promise(r => setTimeout(r, 40));
+    }
+
+    if (burstCandidates.length === 0) {
+      throw new Error('Không chụp được khung hình từ camera');
+    }
+
+    // Chọn ảnh nét nhất
+    burstCandidates.sort((a, b) => b.sharpness - a.sharpness);
+    const bestFrame = burstCandidates[0];
+
+    // Vẽ lên canvas chính để hiển thị kiểm tra
+    canvas.width = bestFrame.canvas.width;
+    canvas.height = bestFrame.canvas.height;
+    canvas.getContext('2d').drawImage(bestFrame.canvas, 0, 0);
+
+    // Chạy OCR trực tiếp trên ảnh nét nhất đã nhị phân hóa
+    let detectedPlate = null;
+    if (tesseractWorker) {
+      const res = await tesseractWorker.recognize(bestFrame.canvas);
+      detectedPlate = cleanAndFormatPlate(res.data.text);
+      console.log('⚡ [OCR Raw]:', res.data.text, '-> [Plate]:', detectedPlate, 'Nét:', bestFrame.sharpness.toFixed(1));
+    }
+
+    const elapsed = Math.round(performance.now() - startTime);
+
+    if (detectedPlate) {
+      lastRecognizedPlate = detectedPlate;
+      lastRecognizedTime = Date.now();
+      showToast(`⚡ Đã nhận diện [${detectedPlate}] trong ${elapsed}ms (Độ nét: ${bestFrame.sharpness.toFixed(0)})`);
+
+      // Gửi ngay lên Cloud Server để đối chiếu Whitelist CSDL và ra quyết định
+      const resp = await fetch('/api/parking/alpr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          plate: detectedPlate,
+          gate: 'entry',
+          confidence: 0.98
+        })
       });
-      const rawText = result.data.text.toUpperCase().replace(/\s+/g, '');
-      
-      // Loc tim chuoi dinh dang bien so xe (VD: 36C-925.64, 30A-123.45, 29B1-23456)
-      const plateRegex = /([0-9]{2}[A-Z]{1,2}[-.]?[0-9]{3,5}[.]?[0-9]{0,2})/;
-      const match = rawText.match(plateRegex);
-      
-      if (match && match[0].length >= 6) {
-        const detectedPlate = match[0];
-        console.log('[OCR Success] Phat hien bien so:', detectedPlate);
-        
-        // Gui truc tiep len Cloud Server API
-        await fetch('/api/parking/alpr', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            plate: detectedPlate,
-            gate: 'entry',
-            confidence: 0.96
-          })
-        });
-      } else if (manual) {
-        showToast('Chưa nhận diện rõ biển số, hãy đưa camera lại gần hơn');
+      const data = await resp.json();
+      console.log('Kết quả từ Cloud Server:', data);
+    } else {
+      // Nếu chưa nhận diện được
+      if (hudPlate && !hudPlate.classList.contains('bg-emerald-400')) {
+        hudPlate.textContent = 'CHƯA RÕ BIỂN SỐ';
+        hudPlate.className = 'bg-slate-700 text-slate-300 px-4 py-2.5 rounded-xl font-mono text-center font-bold text-xl tracking-wider';
+        setTimeout(() => {
+          if (currentVehicleAtEntry === 0 && hudPlate.textContent === 'CHƯA RÕ BIỂN SỐ') {
+            hudPlate.textContent = 'CHỜ XE ĐẾN...';
+            hudPlate.className = 'bg-amber-400 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-amber-400/20 border-2 border-amber-300';
+          }
+        }, 1800);
+      }
+      if (isManual) {
+        showToast('⚠️ Chưa nhận diện rõ biển số! Hãy căn biển số vào đúng khung ngắm.');
       }
     }
   } catch (err) {
-    console.error('Lỗi nhận diện OCR:', err);
+    console.error('Lỗi nhận diện:', err);
+    if (isManual) showToast('Lỗi: ' + err.message);
   } finally {
-    isScanning = false;
-    if (manual && btnScan) btnScan.textContent = 'Quét Biển Số Ngay';
+    isProcessingRecognition = false;
+    if (laser) laser.classList.add('opacity-0');
+    if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
+  }
+}
+
+// Nút bấm kích hoạt thủ công trên giao diện
+function manualTriggerScan() {
+  if (!webcamStream) {
+    toggleWebcamPreview().then(() => {
+      setTimeout(() => triggerBurstRecognition(true), 800);
+    });
+    return;
+  }
+  triggerBurstRecognition(true);
+}
+
+// Xử lý sự kiện cảm biến xe đến cổng vào (từ ESP32 hoặc bộ giả lập)
+function handleVehicleArrivalSensor(isArrived) {
+  const hudPlate = document.getElementById('hud-plate-display');
+  const hudConf = document.getElementById('hud-confidence');
+  const hudAction = document.getElementById('hud-gate-action');
+  const targetBox = document.getElementById('hud-target-box');
+  const simLabel = document.getElementById('sim-label-vehicle');
+
+  if (simLabel) {
+    simLabel.textContent = isArrived ? 'CÓ XE' : 'CHỜ XE';
+    simLabel.className = isArrived ? 'text-amber-400 font-bold animate-pulse' : 'text-slate-400';
+  }
+
+  if (isArrived) {
+    if (currentVehicleAtEntry === 0) {
+      currentVehicleAtEntry = 1;
+      playTone(880, 'sine', 0.15);
+      showToast('🚗 [CẢM BIẾN] Xe đã đến cổng vào! Kích hoạt nhận diện biển số...');
+      
+      // Tự động bật camera nếu đang tắt
+      if (!webcamStream) {
+        startCameraStream().then(() => {
+          setTimeout(() => triggerBurstRecognition(false), 600);
+        });
+      } else {
+        triggerBurstRecognition(false);
+      }
+    }
+  } else {
+    currentVehicleAtEntry = 0;
+    // Khi xe đi qua, sau 3.5s nếu không có xe mới thì đưa giao diện về trạng thái CHỜ XE ĐẾN
+    setTimeout(() => {
+      if (currentVehicleAtEntry === 0) {
+        if (hudPlate && !isProcessingRecognition) {
+          hudPlate.textContent = 'CHỜ XE ĐẾN...';
+          hudPlate.className = 'bg-amber-400 text-slate-950 px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest shadow-lg shadow-amber-400/20 border-2 border-amber-300';
+        }
+        if (hudConf) {
+          hudConf.textContent = '-- %';
+          hudConf.className = 'font-mono text-cyan-400 font-bold';
+        }
+        if (hudAction) {
+          hudAction.textContent = 'Tự động nâng barie';
+          hudAction.className = 'font-semibold text-emerald-400';
+        }
+      }
+    }, 4000);
+  }
+}
+
+// Bật/tắt giả lập cảm biến xe vào cổng
+function toggleSimVehicleEntry() {
+  const nextVal = currentVehicleAtEntry === 1 ? 0 : 1;
+  handleVehicleArrivalSensor(nextVal === 1);
+  if (simMode) {
+    fetch('/api/parking/data', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': 'IOT_SECURE_TOKEN_2026'
+      },
+      body: JSON.stringify({
+        p1: simState.p1,
+        p2: simState.p2,
+        p3: simState.p3,
+        entryGate: simState.entryGate,
+        exitGate: simState.exitGate,
+        vehicleAtEntry: nextVal
+      })
+    }).catch(e => console.error('Sim error:', e));
   }
 }
 
@@ -347,6 +600,11 @@ function renderState(state) {
   if (!state) return;
 
   updateDeviceStatus(state.deviceOnline);
+
+  // Nhận diện tín hiệu cảm biến xe đến cổng vào (PIN 35 từ ESP32)
+  if (state.vehicleAtEntry !== undefined) {
+    handleVehicleArrivalSensor(state.vehicleAtEntry === 1 || state.vehicleAtEntry === true);
+  }
 
   const freeEl = document.getElementById('stat-free-slots');
   const occupiedEl = document.getElementById('stat-occupied-slots');
@@ -741,4 +999,5 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchLogs();
   fetchAnalytics();
   populateCameraList();
+  initTesseractWorker(); // Nạp sẵn Tesseract Worker vào RAM
 });
