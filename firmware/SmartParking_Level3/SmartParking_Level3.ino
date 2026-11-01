@@ -27,7 +27,7 @@
 
 // ================= THONG TIN CAU HINH WIFI VA CLOUD SERVER =================
 const char* WIFI_SSID     = "XANHCAFE.COM";     // Thay bang ten WiFi cua ban (hoac WiFi phat tu dien thoai)
-const char* WIFI_PASSWORD = "motngayvui"; // Thay bang mat khau WiFi
+const char* WIFI_PASSWORD = "motngayvui";        // Thay bang mat khau WiFi
 
 // Cloud Server URL tren Render (Https công khai toàn cầu)
 const char* CLOUD_SERVER_URL = "https://iot-parking.onrender.com/api/parking/data";
@@ -41,7 +41,7 @@ constexpr uint8_t PIN_ENTRY_SENSOR = 35;
 constexpr uint8_t PIN_EXIT_SENSOR  = 36;
 constexpr uint8_t PIN_ENTRY_SERVO  = 25;
 constexpr uint8_t PIN_EXIT_SERVO   = 26;
-constexpr uint8_t PIN_BUZZER       = 27;  
+constexpr uint8_t PIN_BUZZER       = 27;
 constexpr uint8_t PIN_OLED_SDA     = 21;
 constexpr uint8_t PIN_OLED_SCL     = 22;
 
@@ -58,7 +58,15 @@ constexpr uint32_t GATE_CLOSE_CLEAR_MS  = 1000;
 constexpr uint32_t GATE_MAX_OPEN_MS     = 10000;
 constexpr uint32_t OLED_REFRESH_MS      = 300;
 constexpr uint32_t FULL_BEEP_INTERVAL_MS= 1800;
-constexpr uint32_t CLOUD_SYNC_INTERVAL_MS = 1500; // Gui du lieu len Cloud moi 1.5 giay hoac ngay khi co doi
+constexpr uint32_t CLOUD_SYNC_INTERVAL_MS = 1000; // Dong bo voi Cloud moi 1 giay
+
+// [SUA BUZZER] Cau hinh buzzer
+constexpr bool     BUZZER_PASSIVE    = false; // false = buzzer CHU DONG (chi can HIGH/LOW). true = buzzer THU DONG (can phat tan so)
+constexpr bool     BUZZER_ACTIVE_LOW = true;  // true = module kich muc THAP (LOW = keu, HIGH = im)
+constexpr uint16_t BUZZER_FREQ_HZ    = 2000;  // Chi dung khi BUZZER_PASSIVE = true
+constexpr uint8_t  BUZZER_LEDC_CH    = 14;    // Chi dung cho ESP32 core 2.x
+constexpr uint8_t  BUZZER_IDLE_LEVEL = BUZZER_ACTIVE_LOW ? HIGH : LOW;  // Muc chan khi im lang
+constexpr uint8_t  BUZZER_ON_LEVEL   = BUZZER_ACTIVE_LOW ? LOW : HIGH;  // Muc chan khi keu
 
 constexpr uint8_t OLED_WIDTH       = 128;
 constexpr uint8_t OLED_HEIGHT      = 64;
@@ -103,8 +111,7 @@ GateController entryGate;
 GateController exitGate;
 
 bool displayReady    = false;
-bool buzzerOn        = false;
-uint32_t buzzerOffAt = 0;
+volatile bool buzzerOn = false;
 uint32_t lastFullBeepAt = 0;
 uint32_t lastDisplayAt  = 0;
 uint32_t lastCloudSyncAt= 0;
@@ -123,6 +130,67 @@ bool lastSyncedP3   = false;
 bool lastSyncedEntry= false;
 bool lastSyncedExit = false;
 
+// ================= [BUZZER TASK] =================
+struct BeepRequest {
+  uint16_t freq;
+  uint16_t durationMs;
+};
+
+QueueHandle_t buzzerQueue = nullptr;
+
+void buzzerSilence() {
+  if (BUZZER_PASSIVE) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcDetach(PIN_BUZZER);
+#else
+    ledcDetachPin(PIN_BUZZER);
+#endif
+  }
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+}
+
+void buzzerSoundOn(uint16_t freq) {
+  if (BUZZER_PASSIVE) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcAttach(PIN_BUZZER, freq, 8);
+    ledcWriteTone(PIN_BUZZER, freq);
+#else
+    ledcSetup(BUZZER_LEDC_CH, freq, 8);
+    ledcAttachPin(PIN_BUZZER, BUZZER_LEDC_CH);
+    ledcWriteTone(BUZZER_LEDC_CH, freq);
+#endif
+  } else {
+    digitalWrite(PIN_BUZZER, BUZZER_ON_LEVEL);
+  }
+}
+
+void buzzerTask(void *param) {
+  BeepRequest req;
+  for (;;) {
+    if (xQueueReceive(buzzerQueue, &req, portMAX_DELAY) == pdTRUE) {
+      buzzerOn = true;
+      buzzerSoundOn(req.freq);
+      vTaskDelay(pdMS_TO_TICKS(req.durationMs));
+      buzzerSilence();
+      buzzerOn = false;
+      vTaskDelay(pdMS_TO_TICKS(30));
+    }
+  }
+}
+
+void initBuzzer() {
+  buzzerSilence();
+  buzzerQueue = xQueueCreate(2, sizeof(BeepRequest));
+  xTaskCreatePinnedToCore(buzzerTask, "buzzerTask", 2048, nullptr, 1, nullptr, 0);
+}
+
+void startBeep(uint16_t durationMs) {
+  if (buzzerQueue == nullptr) return;
+  BeepRequest req = { BUZZER_FREQ_HZ, durationMs };
+  xQueueSend(buzzerQueue, &req, 0);
+}
+
 // ================= CAC HAM XU LY PHAN CUNG =================
 bool readDetected(uint8_t pin) {
   const int level = digitalRead(pin);
@@ -138,19 +206,6 @@ void updateSensor(DebouncedSensor &sensor, uint8_t pin, uint32_t now) {
   if (sensor.stableDetected != sensor.rawDetected &&
       now - sensor.rawChangedAt >= SENSOR_DEBOUNCE_MS) {
     sensor.stableDetected = sensor.rawDetected;
-  }
-}
-
-void startBeep(uint16_t durationMs) {
-  digitalWrite(PIN_BUZZER, HIGH);
-  buzzerOn = true;
-  buzzerOffAt = millis() + durationMs;
-}
-
-void updateBuzzer(uint32_t now) {
-  if (buzzerOn && static_cast<int32_t>(now - buzzerOffAt) >= 0) {
-    digitalWrite(PIN_BUZZER, LOW);
-    buzzerOn = false;
   }
 }
 
@@ -195,23 +250,40 @@ void updateParkingStatus() {
   parkingFull = (freeSlots == 0);
 }
 
+/**
+ * ==============================================================================
+ * LOGIC QUY TRINH 7 BUOC:
+ * - CONG VAO (isEntry = true): TUYET DOI KHONG TU DONG MO khi thay xe!
+ *   Cac buoc: Xe den -> Cam bien GPIO 35 phat hien -> ESP32 gui bao xe len Web ->
+ *   Cho Camera quet bien so -> Web so CSDL hop le -> Web gui lenh "OPEN_ENTRY" -> ESP32 moi mo cong!
+ * - CONG RA (isEntry = false): Tu dong mo khi xe ra den vach cam bien GPIO 36.
+ * ==============================================================================
+ */
 void updateGate(GateController &gate, bool vehicleAtGate, bool isEntry, uint32_t now) {
   if (gate.state == GATE_CLOSED) {
     if (vehicleAtGate) {
-      if (isEntry && parkingFull) {
-        if (!buzzerOn && now - lastFullBeepAt >= FULL_BEEP_INTERVAL_MS) {
-          startBeep(250);
-          lastFullBeepAt = now;
+      if (isEntry) {
+        // [QUY TRINH 7 BUOC] CONG VAO: GIU NGUYEN TRANG THAI DONG!
+        // Chi keu tieng bip ngan thong bao da nhan dien co xe den vung cho quet bien so
+        static uint32_t lastEntryPromptBeep = 0;
+        if (now - lastEntryPromptBeep >= 3000) {
+          lastEntryPromptBeep = now;
+          if (parkingFull) {
+            startBeep(350); // Bai day keu dai canh bao
+          } else {
+            startBeep(60);  // Bip ngan: "Xe da vao vung quet bien so"
+          }
         }
       } else {
-        if (isEntry) setEntryGate(true, now);
-        else setExitGate(true, now);
+        // CONG RA: Tu dong nang barie cho xe ra
+        setExitGate(true, now);
         startBeep(90);
       }
     }
     return;
   }
 
+  // Khi cong dang MO: Cho xe di qua het khoi vung cam bien roi dong lai an toan
   if (vehicleAtGate) {
     gate.waitingForClear = false;
     if (now - gate.openedAt >= GATE_MAX_OPEN_MS && !gate.timeoutReported) {
@@ -245,7 +317,7 @@ void updateDisplay(uint32_t now) {
   display.print(F("P1:")); display.print(occupiedP1 ? F("XE ") : F("TRG "));
   display.print(F("P2:")); display.print(occupiedP2 ? F("XE ") : F("TRG "));
   display.print(F("P3:")); display.println(occupiedP3 ? F("XE") : F("TRG"));
-  display.print(F("Vao:")); display.print(entryGateOpen ? F("MO ") : F("DONG "));
+  display.print(F("Vao:")); display.print(entryGateOpen ? F("MO ") : F("CHO "));
   display.print(F("Ra:")); display.println(exitGateOpen ? F("MO") : F("DONG"));
   if (parkingFull) display.println(F(">>> BAI XE DAY <<<"));
   display.display();
@@ -254,49 +326,60 @@ void updateDisplay(uint32_t now) {
 // ================= GIAO TIEP DAM MAY IOT CAP DO 3 (REST API) =================
 void sendTelemetryToCloud() {
   if (WiFi.status() != WL_CONNECTED) {
-    return; // Tu dong giu hoat dong cuc bo neu mat WiFi
+    return;
   }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Cho phep ket noi HTTPS an toan ma khong can nạp file chung chi SSL rườm rà
+  client.setInsecure();
 
   HTTPClient http;
   http.begin(client, CLOUD_SERVER_URL);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-API-Key", IOT_API_KEY);
 
-  // Dong goi JSON Telemetry
+  // Dong goi JSON Telemetry kem trang thai xe dang o cong vao
   String payload = "{";
   payload += "\"p1\":" + String(occupiedP1 ? 1 : 0) + ",";
   payload += "\"p2\":" + String(occupiedP2 ? 1 : 0) + ",";
   payload += "\"p3\":" + String(occupiedP3 ? 1 : 0) + ",";
   payload += "\"entryGate\":" + String(entryGateOpen ? 1 : 0) + ",";
   payload += "\"exitGate\":" + String(exitGateOpen ? 1 : 0) + ",";
+  payload += "\"vehicleAtEntry\":" + String(sensors[SENSOR_ENTRY].stableDetected ? 1 : 0) + ",";
+  payload += "\"vehicleAtExit\":" + String(sensors[SENSOR_EXIT].stableDetected ? 1 : 0) + ",";
   payload += "\"free\":" + String(freeSlots);
   payload += "}";
 
   int httpCode = http.POST(payload);
-  if (httpCode == HTTP_CODE_OK || httpCode == 201) {
+  if (httpCode >= 200 && httpCode < 300) {
     String response = http.getString();
-    // Kiem tra xem Server co gui lenh dieu khien tu xa (Remote Actuator) khong
-    if (response.indexOf("\"command\":\"OPEN_ENTRY\"") > 0) {
-      Serial.println("[Cloud Action] Nhan lenh mo cong vao tu Web!");
+    response.replace(" ", "");
+    response.replace("\n", "");
+    response.replace("\r", "");
+    response.replace("\t", "");
+
+    if (response.indexOf("command") >= 0) {
+      Serial.print(F("[Cloud] Response: "));
+      Serial.println(response);
+    }
+
+    // CHI MO CONG VAO KHI NHAN LENH CHINH THUC "OPEN_ENTRY" TU WEBSITE (DA SO KHOP BIEN SO HOP LE)
+    if (response.indexOf("OPEN_ENTRY") >= 0) {
+      Serial.println("[Cloud Action] Nhan lenh mo cong vao tu Web (Bien so hop le)!");
       setEntryGate(true, millis());
       startBeep(120);
-    } else if (response.indexOf("\"command\":\"OPEN_EXIT\"") > 0) {
+    }
+    if (response.indexOf("OPEN_EXIT") >= 0) {
       Serial.println("[Cloud Action] Nhan lenh mo cong ra tu Web!");
       setExitGate(true, millis());
       startBeep(120);
-    } else if (response.indexOf("\"command\":\"TRIGGER_BUZZER\"") > 0) {
+    }
+    if (response.indexOf("TRIGGER_BUZZER") >= 0) {
       Serial.println("[Cloud Action] Nhan lenh bat coi tu Web!");
       startBeep(800);
     }
-  } else {
-    // Serial.printf("[Cloud] POST failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
   http.end();
 
-  // Luu lai trang thai da dong bo
   lastSyncedP1    = occupiedP1;
   lastSyncedP2    = occupiedP2;
   lastSyncedP3    = occupiedP3;
@@ -306,6 +389,9 @@ void sendTelemetryToCloud() {
 
 // ================= SETUP =================
 void setup() {
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, BUZZER_IDLE_LEVEL);
+
   Serial.begin(115200);
   Serial.println(F("\n--- KHOI DONG HE THONG IOT CAP DO 3: SMART PARKING ---"));
 
@@ -315,8 +401,6 @@ void setup() {
     sensors[i].stableDetected = sensors[i].rawDetected;
     sensors[i].rawChangedAt = millis();
   }
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
 
   Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
   displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS);
@@ -328,9 +412,9 @@ void setup() {
   entryGateOpen = false;
   exitGateOpen = false;
 
+  initBuzzer();
   updateParkingStatus();
 
-  // Ket noi WiFi
   Serial.printf("Dang ket noi WiFi toi '%s'...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -350,28 +434,25 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-  // 1. Cap nhat doc cam bien
   for (uint8_t i = 0; i < SENSOR_COUNT; ++i) {
     updateSensor(sensors[i], SENSOR_PINS[i], now);
   }
 
-  // 2. Tinh toan trang thai bai xe
   updateParkingStatus();
 
-  // 3. Logic dieu khien barie va coi
+  // Logic dieu khien barie:
+  // Cong vao tuyet doi khong tu mo, cho lenh Web
   updateGate(entryGate, sensors[SENSOR_ENTRY].stableDetected, true, now);
   updateGate(exitGate, sensors[SENSOR_EXIT].stableDetected, false, now);
-  updateBuzzer(now);
 
-  // 4. Cap nhat man hinh OLED
   updateDisplay(now);
 
-  // 5. Kiem tra co su kien thay doi trang thai hoac den chu ky dong bo len Cloud Server
   const bool stateChanged = (occupiedP1 != lastSyncedP1) ||
                             (occupiedP2 != lastSyncedP2) ||
                             (occupiedP3 != lastSyncedP3) ||
                             (entryGateOpen != lastSyncedEntry) ||
-                            (exitGateOpen != lastSyncedExit);
+                            (exitGateOpen != lastSyncedExit) ||
+                            (sensors[SENSOR_ENTRY].stableDetected);
 
   if (stateChanged || (now - lastCloudSyncAt >= CLOUD_SYNC_INTERVAL_MS)) {
     lastCloudSyncAt = now;
