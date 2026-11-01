@@ -18,6 +18,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Wire.h>
 #include <ESP32Servo.h>
@@ -28,14 +29,9 @@
 const char* WIFI_SSID     = "XANHCAFE.COM";     // Thay bang ten WiFi cua ban (hoac WiFi phat tu dien thoai)
 const char* WIFI_PASSWORD = "motngayvui"; // Thay bang mat khau WiFi
 
-// Dia chi IP may tinh dang chay Web Server (Port mac dinh la 3000)
-// Kiem tra bang cach go 'ipconfig' tren may tinh hoac nhin cua so server Node.js
-const char* SERVER_HOST   = "192.168.1.14"; 
-const int   SERVER_PORT   = 3000;
-const char* IOT_API_KEY   = "IOT_SECURE_TOKEN_2026"; // Khoa bi mat xac thuc thiet bi IoT
-
-// URL Endpoint gui du lieu REST API
-String serverUrl = String("http://") + SERVER_HOST + ":" + String(SERVER_PORT) + "/api/parking/data";
+// Cloud Server URL tren Render (Https công khai toàn cầu)
+const char* CLOUD_SERVER_URL = "https://iot-parking.onrender.com/api/parking/data";
+const char* IOT_API_KEY      = "IOT_SECURE_TOKEN_2026"; // Khoa bi mat xac thuc thiet bi IoT
 
 // ================= DINH NGHIA PHAN CUNG =================
 constexpr uint8_t PIN_P1_SENSOR    = 32;
@@ -261,8 +257,11 @@ void sendTelemetryToCloud() {
     return; // Tu dong giu hoat dong cuc bo neu mat WiFi
   }
 
+  WiFiClientSecure client;
+  client.setInsecure(); // Cho phep ket noi HTTPS an toan ma khong can nạp file chung chi SSL rườm rà
+
   HTTPClient http;
-  http.begin(serverUrl);
+  http.begin(client, CLOUD_SERVER_URL);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-API-Key", IOT_API_KEY);
 
