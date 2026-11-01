@@ -157,6 +157,70 @@ function initWebSocket() {
 
 // Live Webcam Stream Directly on Browser
 let webcamStream = null;
+let currentCameraId = null;
+
+async function populateCameraList() {
+  const select = document.getElementById('camera-select');
+  if (!select) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoDevices = devices.filter(d => d.kind === 'videoinput');
+    select.innerHTML = '';
+    
+    if (videoDevices.length === 0) {
+      select.innerHTML = '<option value="">Không thấy camera</option>';
+      return;
+    }
+
+    let defaultIndex = 0;
+    videoDevices.forEach((device, idx) => {
+      const opt = document.createElement('option');
+      opt.value = device.deviceId;
+      opt.text = device.label || `Camera ${idx + 1}`;
+      // Tự động ưu tiên chọn iVCam hoặc camera ngoài
+      if (opt.text.toLowerCase().includes('ivcam') || opt.text.toLowerCase().includes('e2esoft')) {
+        defaultIndex = idx;
+      }
+      select.appendChild(opt);
+    });
+
+    select.selectedIndex = defaultIndex;
+    currentCameraId = select.value;
+  } catch (err) {
+    console.error('Lỗi lấy danh sách camera:', err);
+  }
+}
+
+async function changeCameraSource() {
+  const select = document.getElementById('camera-select');
+  currentCameraId = select.value;
+  if (webcamStream) {
+    // Nếu đang bật camera thì khởi động lại với camera mới
+    webcamStream.getTracks().forEach(track => track.stop());
+    webcamStream = null;
+    startCameraStream();
+  }
+}
+
+async function startCameraStream() {
+  const video = document.getElementById('webcam-video');
+  const placeholder = document.getElementById('cam-placeholder');
+  const btnText = document.getElementById('text-btn-cam');
+  try {
+    const constraints = {
+      video: currentCameraId ? { deviceId: { exact: currentCameraId }, width: { ideal: 1280 } } : { width: { ideal: 1280 } }
+    };
+    webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = webcamStream;
+    video.classList.remove('hidden');
+    placeholder.classList.add('hidden');
+    btnText.textContent = 'Tắt Camera';
+    populateCameraList(); // Cập nhật tên nhãn sau khi đã cấp quyền
+  } catch (err) {
+    alert('Không thể mở camera: ' + err.message);
+  }
+}
+
 async function toggleWebcamPreview() {
   const video = document.getElementById('webcam-video');
   const placeholder = document.getElementById('cam-placeholder');
@@ -167,32 +231,9 @@ async function toggleWebcamPreview() {
     webcamStream = null;
     video.classList.add('hidden');
     placeholder.classList.remove('hidden');
-    btnText.textContent = 'Mở Camera Trên Web';
+    btnText.textContent = 'Bật Camera';
   } else {
-    try {
-      // Tìm camera iVCam nếu có nhiều thiết bị
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const videoDevices = devices.filter(d => d.kind === 'videoinput');
-      let targetDeviceId = undefined;
-      
-      const ivcamDevice = videoDevices.find(d => d.label.toLowerCase().includes('ivcam') || d.label.toLowerCase().includes('e2esoft'));
-      if (ivcamDevice) {
-        targetDeviceId = { exact: ivcamDevice.deviceId };
-      } else if (videoDevices.length > 1) {
-        // Neu co tu 2 camera tro len thi uu tien camera phu (thuong la iVCam)
-        targetDeviceId = { exact: videoDevices[videoDevices.length - 1].deviceId };
-      }
-
-      webcamStream = await navigator.mediaDevices.getUserMedia({ 
-        video: targetDeviceId ? { deviceId: targetDeviceId, width: { ideal: 1280 } } : { width: { ideal: 1280 } } 
-      });
-      video.srcObject = webcamStream;
-      video.classList.remove('hidden');
-      placeholder.classList.add('hidden');
-      btnText.textContent = 'Tắt Camera Trên Web';
-    } catch (err) {
-      alert('Không thể mở camera trên trình duyệt: ' + err.message + '\nBạn hãy chạy qua file start_ivcam_ai.bat!');
-    }
+    startCameraStream();
   }
 }
 
@@ -595,4 +636,5 @@ document.addEventListener('DOMContentLoaded', () => {
   initCharts();
   fetchLogs();
   fetchAnalytics();
+  populateCameraList();
 });

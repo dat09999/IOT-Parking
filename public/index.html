@@ -469,9 +469,13 @@
         </div>
 
         <div class="flex items-center gap-2 text-xs">
+          <!-- Device Selector Dropdown -->
+          <select id="camera-select" onchange="changeCameraSource()" class="bg-slate-800 text-slate-200 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs focus:ring-1 focus:ring-cyan-500 outline-none">
+            <option value="">Đang tìm camera...</option>
+          </select>
           <button onclick="toggleWebcamPreview()" id="btn-toggle-cam" class="btn-neon px-3.5 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-semibold flex items-center gap-1.5 transition">
             <i class="fa-solid fa-camera"></i>
-            <span id="text-btn-cam">Mở Camera Trên Web</span>
+            <span id="text-btn-cam">Bật Camera</span>
           </button>
         </div>
       </div>
