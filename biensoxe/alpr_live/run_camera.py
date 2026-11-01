@@ -98,9 +98,15 @@ def main() -> int:
         ocr_device="cpu",
     )
 
-    camera = cv2.VideoCapture(parse_source(args.source))
+    camera = cv2.VideoCapture(parse_source(args.source), cv2.CAP_DSHOW)
+    if not camera.isOpened():
+        camera = cv2.VideoCapture(parse_source(args.source))
     if not camera.isOpened():
         raise RuntimeError("Could not open source. Check the camera number or stream URL.")
+    
+    # Ép camera chạy độ phân giải 640x480 để xử lý tức thì không bị nghẽn
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     frame_number = 0
@@ -114,6 +120,8 @@ def main() -> int:
     print("Camera ready. Press Q in the video window to quit.")
     try:
         while True:
+            # Bỏ mọi frame đệm cũ để luôn lấy frame thời gian thực mới nhất 0ms độ trễ
+            camera.grab()
             ok, frame = camera.read()
             if not ok:
                 print("No frame received; check that the camera stream is still active.")
@@ -121,64 +129,60 @@ def main() -> int:
             frame_number += 1
             now = time.monotonic()
 
-            if frame_number % args.every == 0:
-                results = list(alpr.predict(frame))
-                if results:
-                    for result in results:
-                        bounds = result.detection.bounding_box
-                        x1, y1, x2, y2 = map(
-                            int, (bounds.x1, bounds.y1, bounds.x2, bounds.y2)
-                        )
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                        
-                        plate_crop = frame[y1:y2, x1:x2]
-                        sharpness = calculate_sharpness(plate_crop)
-                        text = result.ocr.text if result.ocr else "Unreadable"
-                        score = result.detection.confidence
+            results = list(alpr.predict(frame))
+            if results:
+                for result in results:
+                    bounds = result.detection.bounding_box
+                    x1, y1, x2, y2 = map(
+                        int, (bounds.x1, bounds.y1, bounds.x2, bounds.y2)
+                    )
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                    
+                    plate_crop = frame[y1:y2, x1:x2]
+                    sharpness = calculate_sharpness(plate_crop)
+                    text = result.ocr.text if result.ocr else "Unreadable"
+                    score = result.detection.confidence
 
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (40, 220, 40), 2)
-                        cv2.putText(
-                            frame,
-                            f"{text} {score:.2f} (Sharp:{sharpness:.0f})",
-                            (x1, max(24, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (40, 220, 40),
-                            2,
-                            cv2.LINE_AA,
-                        )
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (40, 220, 40), 2)
+                    cv2.putText(
+                        frame,
+                        f"{text} {score:.2f} (Sharp:{sharpness:.0f})",
+                        (x1, max(24, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (40, 220, 40),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
-                        if text and text != "Unreadable" and len(text) >= 5:
-                            plate_candidates.append({
-                                "text": text,
-                                "score": score,
-                                "sharpness": sharpness,
-                                "time": now
-                            })
-                            last_detected_time = now
+                    if text and text != "Unreadable" and len(text) >= 5:
+                        plate_candidates.append({
+                            "text": text,
+                            "score": score,
+                            "sharpness": sharpness,
+                            "time": now
+                        })
+                        last_detected_time = now
 
-                # Khi xe xuất hiện, chọn ra 2-3 frame có độ nét (sharpness) tốt nhất để gửi lên Cloud
-                if plate_candidates and (len(plate_candidates) >= 3 or (now - last_detected_time > 0.4 and plate_candidates)):
-                    # Sắp xếp lấy ứng viên có độ nét (sharpness) và độ tin cậy (score) cao nhất
-                    plate_candidates.sort(key=lambda c: (c["sharpness"] * 0.7 + c["score"] * 100 * 0.3), reverse=True)
-                    best_candidate = plate_candidates[0]
-                    chosen_plate = best_candidate["text"]
-                    best_score = best_candidate["score"]
-                    best_sharp = best_candidate["sharpness"]
+            # Khi gom được 2 frame hoặc sau 0.15s là tuyển chọn ngay lập tức
+            if plate_candidates and (len(plate_candidates) >= 2 or (now - last_detected_time > 0.15 and plate_candidates)):
+                plate_candidates.sort(key=lambda c: (c["sharpness"] * 0.7 + c["score"] * 100 * 0.3), reverse=True)
+                best_candidate = plate_candidates[0]
+                chosen_plate = best_candidate["text"]
+                best_score = best_candidate["score"]
+                best_sharp = best_candidate["sharpness"]
 
-                    # Chỉ gửi lên Cloud nếu chưa gửi trong vòng 2.5s (tránh spam)
-                    if now - last_printed.get(chosen_plate, 0) >= 2.5:
-                        print(f"\n[AI Tuyển Chọn Frame Nét Nhất]")
-                        print(f" -> Biển số: {chosen_plate} | Độ nét: {best_sharp:.1f} | Tin cậy: {best_score:.2f}")
-                        last_printed[chosen_plate] = now
-                        if args.cloud_url:
-                            post_to_cloud_async(args.cloud_url, {
-                                "plate": chosen_plate,
-                                "gate": args.gate,
-                                "confidence": float(best_score)
-                            })
-                    plate_candidates.clear()
+                if now - last_printed.get(chosen_plate, 0) >= 2.0:
+                    print(f"\n[AI BẮN NGAY TỨC THÌ] -> {chosen_plate} (Nét: {best_sharp:.0f}, Conf: {best_score:.2f})")
+                    last_printed[chosen_plate] = now
+                    if args.cloud_url:
+                        post_to_cloud_async(args.cloud_url, {
+                            "plate": chosen_plate,
+                            "gate": args.gate,
+                            "confidence": float(best_score)
+                        })
+                plate_candidates.clear()
 
             cv2.imshow("Pretrained ALPR - press Q to quit", frame)
             if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
