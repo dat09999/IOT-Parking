@@ -180,6 +180,7 @@ function initWebSocket() {
 // Live Webcam Stream Directly on Browser
 let webcamStream = null;
 let currentCameraId = null;
+let cameraSelectionExplicit = false;
 let tesseractWorker = null;
 let isWorkerReady = false;
 let isWorkerLoading = false;
@@ -187,28 +188,85 @@ let currentVehicleAtEntry = 0;
 let isProcessingRecognition = false;
 let lastRecognizedPlate = '';
 let lastRecognizedTime = 0;
+let lastRecognizedConfidence = null;
+let workerInitPromise = null;
+let workerGeneration = 0;
+let recognitionSessionId = 0;
+let activeCycleIsManual = false;
+let activeCycleSession = null;
+let retryIsManual = false;
+let activeRecognitionRequest = null;
+
+function clearRecognitionTimers() {
+  clearTimeout(retryTimer);
+  clearInterval(countdownInterval);
+  retryTimer = null;
+  countdownInterval = null;
+  retryIsManual = false;
+}
+
+function cancelRecognitionCycle() {
+  const hadActiveCycle = isCycleRunning;
+  recognitionSessionId++;
+  clearRecognitionTimers();
+  isCycleRunning = false;
+  activeCycleSession = null;
+  activeCycleIsManual = false;
+  if (activeRecognitionRequest) activeRecognitionRequest.abort();
+  activeRecognitionRequest = null;
+  if (hadActiveCycle) resetTesseractWorker().catch(err => console.warn('Không dừng được bộ OCR:', err));
+}
+
+async function resetTesseractWorker() {
+  workerGeneration++;
+  const worker = tesseractWorker;
+  tesseractWorker = null;
+  isWorkerReady = false;
+  workerInitPromise = null;
+  isWorkerLoading = false;
+  if (worker) await worker.terminate().catch(() => {});
+}
+
+function withRecognitionTimeout(promise, milliseconds, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), milliseconds); })
+  ]).finally(() => clearTimeout(timer));
+}
 
 // Khởi tạo Tesseract OCR Worker chạy ngầm siêu tốc ngay từ khi mở trang (Preload into RAM)
 async function initTesseractWorker() {
-  if (tesseractWorker || isWorkerLoading) return;
+  if (isWorkerReady && tesseractWorker) return tesseractWorker;
+  if (workerInitPromise) return workerInitPromise;
   isWorkerLoading = true;
-  try {
-    if (window.Tesseract) {
-      tesseractWorker = await Tesseract.createWorker('eng', 1, {
-        logger: () => {} // Tắt log ngầm để tối ưu hiệu năng
-      });
-      await tesseractWorker.setParameters({
+  const generation = workerGeneration;
+  workerInitPromise = Promise.resolve().then(async () => {
+    let worker;
+    try {
+      if (!window.Tesseract) throw new Error('Không tải được thư viện OCR. Kiểm tra kết nối mạng rồi tải lại trang.');
+      worker = await Tesseract.createWorker('eng', 1, { logger: () => {} });
+      await worker.setParameters({
         tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-',
-        tessedit_pageseg_mode: '7' // PSM 7: SINGLE_LINE (Cực kỳ nhanh và chuẩn cho biển số 1 dòng)
+        tessedit_pageseg_mode: '11'
       });
+      if (generation !== workerGeneration) throw new Error('OCR đã được khởi động lại.');
+      tesseractWorker = worker;
       isWorkerReady = true;
-      console.log('⚡ [AI ALPR] Tesseract OCR Worker đã nạp sẵn vào RAM, sẵn sàng nhận diện tức thì!');
+      return worker;
+    } catch (err) {
+      if (worker) await worker.terminate().catch(() => {});
+      if (generation === workerGeneration) {
+        tesseractWorker = null;
+        isWorkerReady = false;
+        workerInitPromise = null;
+      }
+      throw err;
+    } finally {
+      if (generation === workerGeneration) isWorkerLoading = false;
     }
-  } catch (err) {
-    console.warn('⚠️ Chưa nạp được Tesseract Worker:', err);
-  } finally {
-    isWorkerLoading = false;
-  }
+  });
+  return workerInitPromise;
 }
 
 async function populateCameraList() {
@@ -235,7 +293,9 @@ async function populateCameraList() {
       select.appendChild(opt);
     });
 
-    select.selectedIndex = defaultIndex;
+    const activeId = webcamStream?.getVideoTracks()[0]?.getSettings().deviceId || currentCameraId;
+    const activeIndex = videoDevices.findIndex(device => device.deviceId === activeId);
+    select.selectedIndex = activeIndex >= 0 ? activeIndex : defaultIndex;
     currentCameraId = select.value;
   } catch (err) {
     console.error('Lỗi lấy danh sách camera:', err);
@@ -244,12 +304,31 @@ async function populateCameraList() {
 
 async function changeCameraSource() {
   const select = document.getElementById('camera-select');
+  cameraSelectionExplicit = true;
   currentCameraId = select.value;
   if (webcamStream) {
+    cancelRecognitionCycle();
     webcamStream.getTracks().forEach(track => track.stop());
     webcamStream = null;
-    startCameraStream();
+    await startCameraStream();
   }
+}
+
+function waitForVideoReady(video, timeoutMs = 8000) {
+  if (video.videoWidth > 0 && video.readyState >= 2) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const finish = error => {
+      clearTimeout(timer);
+      video.removeEventListener('loadeddata', ready);
+      video.removeEventListener('error', failed);
+      error ? reject(error) : resolve();
+    };
+    const ready = () => { if (video.videoWidth > 0) finish(); };
+    const failed = () => finish(new Error('Camera chưa truyền được hình. Kiểm tra kết nối iVCam.'));
+    const timer = setTimeout(failed, timeoutMs);
+    video.addEventListener('loadeddata', ready);
+    video.addEventListener('error', failed);
+  });
 }
 
 async function startCameraStream() {
@@ -261,13 +340,27 @@ async function startCameraStream() {
       video: currentCameraId ? { deviceId: { exact: currentCameraId }, width: { ideal: 1280 } } : { width: { ideal: 1280 } }
     };
     webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+    // Device labels become available after permission; verify the actual stream.
+    if (!cameraSelectionExplicit) {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const preferred = devices.find(device => device.kind === 'videoinput' && /ivcam|e2esoft/i.test(device.label));
+      if (preferred && webcamStream.getVideoTracks()[0]?.getSettings().deviceId !== preferred.deviceId) {
+        webcamStream.getTracks().forEach(track => track.stop());
+        webcamStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: preferred.deviceId }, width: { ideal: 1280 } } });
+      }
+    }
     video.srcObject = webcamStream;
+    await video.play();
+    await waitForVideoReady(video);
     video.classList.remove('hidden');
     placeholder.classList.add('hidden');
     btnText.textContent = 'Tắt Camera';
-    populateCameraList();
-    initTesseractWorker(); // Đảm bảo worker sẵn sàng
+    await populateCameraList();
+    initTesseractWorker().catch(err => console.warn('OCR chưa sẵn sàng:', err));
   } catch (err) {
+    if (webcamStream) webcamStream.getTracks().forEach(track => track.stop());
+    webcamStream = null;
+    video.srcObject = null;
     alert('Không thể mở camera: ' + err.message);
   }
 }
@@ -278,8 +371,10 @@ async function toggleWebcamPreview() {
   const btnText = document.getElementById('text-btn-cam');
 
   if (webcamStream) {
+    cancelRecognitionCycle();
     webcamStream.getTracks().forEach(track => track.stop());
     webcamStream = null;
+    video.srcObject = null;
     video.classList.add('hidden');
     placeholder.classList.remove('hidden');
     btnText.textContent = 'Bật Camera';
@@ -319,7 +414,7 @@ function evaluateSharpness(imageData) {
 function enhanceCanvasForOCR(srcCanvas) {
   const targetCanvas = document.createElement('canvas');
   // Kích thước chuẩn dễ nhận diện nhất (rộng 720px)
-  const targetW = 720;
+  const targetW = Math.min(1600, Math.max(720, srcCanvas.width));
   const targetH = Math.round((srcCanvas.height / srcCanvas.width) * targetW);
   targetCanvas.width = targetW;
   targetCanvas.height = targetH;
@@ -355,58 +450,119 @@ function enhanceCanvasForOCR(srcCanvas) {
 
 // Chuẩn hóa và làm sạch chuỗi biển số nhận diện
 function cleanAndFormatPlate(rawText) {
-  if (!rawText) return null;
+  return ParkingAlpr.cleanAndFormatPlate(rawText);
+}
 
-  // 1. Tìm trực tiếp mẫu có dấu gạch ngang (ví dụ 36C-925.64, 30A-999.99)
-  const directMatch = rawText.match(/([0-9]{2}[A-Z]{1,2}[-.\s]?[0-9]{3,5}[.]?[0-9]{0,2})/i);
-  if (directMatch && directMatch[0].length >= 6) {
-    const raw = directMatch[0].toUpperCase().replace(/\s+/g, '');
-    const clean = raw.replace(/[^A-Z0-9]/g, '');
-    const prov = clean.slice(0, 2);
-    let series = '';
-    let numPart = '';
-    if (isNaN(clean[2]) && isNaN(clean[3])) {
-      series = clean.slice(2, 4);
-      numPart = clean.slice(4);
-    } else {
-      series = clean.slice(2, 3);
-      numPart = clean.slice(3);
-    }
-    if (numPart.length === 5) {
-      return `${prov}${series}-${numPart.slice(0, 3)}.${numPart.slice(3)}`;
-    } else if (numPart.length === 4) {
-      return `${prov}${series}-${numPart}`;
-    }
-    return raw;
+// Use sparse text on the scene, then single-line OCR only on text crops.
+function plateImageRegions(source) {
+  const preview = document.createElement('canvas');
+  preview.width = Math.min(source.width, 640);
+  preview.height = Math.round(source.height * preview.width / source.width);
+  const context = preview.getContext('2d', { willReadFrequently: true });
+  context.drawImage(source, 0, 0, preview.width, preview.height);
+  const pixels = context.getImageData(0, 0, preview.width, preview.height).data;
+  const width = preview.width, height = preview.height;
+  const bright = new Uint8Array(width * height);
+  for (let i = 0; i < bright.length; i++) {
+    const p = i * 4;
+    bright[i] = pixels[p] > 120 && pixels[p + 1] > 120 &&
+      0.299 * pixels[p] + 0.587 * pixels[p + 1] + 0.114 * pixels[p + 2] > 160 ? 1 : 0;
   }
-
-  // 2. Tìm trong chuỗi bỏ ký tự đặc biệt
-  const cleanAll = rawText.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const vnMatch = cleanAll.match(/([0-9]{2}[A-Z]{1,2}[0-9]{4,5})/);
-  if (vnMatch) {
-    const p = vnMatch[0];
-    const prov = p.slice(0, 2);
-    let series = '';
-    let numPart = '';
-    if (isNaN(p[2]) && isNaN(p[3])) {
-      series = p.slice(2, 4);
-      numPart = p.slice(4);
-    } else {
-      series = p.slice(2, 3);
-      numPart = p.slice(3);
+  const queue = new Int32Array(bright.length);
+  const regions = [];
+  const scale = source.width / width;
+  for (let start = 0; start < bright.length; start++) {
+    if (!bright[start]) continue;
+    let head = 0, tail = 1, count = 0;
+    let left = start % width, right = left, top = Math.floor(start / width), bottom = top;
+    queue[0] = start;
+    bright[start] = 0;
+    while (head < tail) {
+      const at = queue[head++];
+      const x = at % width, y = Math.floor(at / width);
+      count++;
+      left = Math.min(left, x); right = Math.max(right, x);
+      top = Math.min(top, y); bottom = Math.max(bottom, y);
+      for (const next of [x > 0 ? at - 1 : -1, x + 1 < width ? at + 1 : -1,
+        y > 0 ? at - width : -1, y + 1 < height ? at + width : -1]) {
+        if (next >= 0 && bright[next]) { bright[next] = 0; queue[tail++] = next; }
+      }
     }
-    if (numPart.length === 5) {
-      return `${prov}${series}-${numPart.slice(0, 3)}.${numPart.slice(3)}`;
-    } else {
-      return `${prov}${series}-${numPart}`;
+    const w = right - left + 1, h = bottom - top + 1;
+    const aspect = w / h, fill = count / (w * h);
+    if (w < 60 || h < 12 || aspect < 1.2 || aspect > 7 ||
+      w * h > width * height * 0.45 || fill < 0.45 || fill > 0.98) continue;
+    const x = Math.max(0, Math.floor((left - 3) * scale));
+    const y = Math.max(0, Math.floor((top - 3) * scale));
+    regions.push({ x, y, width: Math.min(source.width - x, Math.ceil((w + 6) * scale)),
+      height: Math.min(source.height - y, Math.ceil((h + 6) * scale)),
+      score: (1 - fill) * Math.sqrt(w * h) });
+  }
+  return regions.sort((a, b) => b.score - a.score).slice(0, 2);
+}
+
+function plateTextRegions(data, width, height) {
+  const lines = data.lines?.length ? data.lines : data.words || [];
+  return lines.filter(line => /[0-9]{2}[\s.-]*[A-Z]/i.test(line.text || '') && line.bbox)
+    .slice(0, 2).map(line => {
+      const box = line.bbox;
+      const padX = Math.max(12, (box.x1 - box.x0) * 0.08);
+      const padY = Math.max(12, (box.y1 - box.y0) * 0.3);
+      const x = Math.max(0, Math.floor(box.x0 - padX));
+      const y = Math.max(0, Math.floor(box.y0 - padY));
+      return { x, y, width: Math.min(width, Math.ceil(box.x1 + padX)) - x,
+        height: Math.min(height, Math.ceil(box.y1 + padY)) - y };
+    }).filter(box => box.width > 0 && box.height > 0);
+}
+
+async function readPlateFrame(worker, candidate, assertCurrent) {
+  const readings = [];
+  const collect = data => {
+    const lines = data.lines || [];
+    for (const result of [data, ...lines]) {
+      for (const plate of ParkingAlpr.extractPlateCandidates(result.text)) {
+        readings.push({ plate, confidence: Number(result.confidence) || 0, frameId: candidate.index });
+      }
+    }
+  };
+  // White/yellow plate backgrounds can be found without OCR of the dark scene.
+  // Keep the whole-scene path below for plates these simple regions miss.
+  for (const region of plateImageRegions(candidate.canvas)) {
+    const crop = document.createElement('canvas');
+    crop.width = region.width;
+    crop.height = region.height;
+    crop.getContext('2d').drawImage(candidate.canvas, region.x, region.y, region.width, region.height,
+      0, 0, region.width, region.height);
+    const psm = region.width / region.height >= 2.4 ? '7' : '6';
+    await withRecognitionTimeout(worker.setParameters({ tessedit_pageseg_mode: psm }), 20000, 'Bộ OCR không phản hồi. Đang khởi động lại.');
+    for (const image of [crop, enhanceCanvasForOCR(crop)]) {
+      const result = await withRecognitionTimeout(worker.recognize(image), 20000, 'OCR xử lý quá lâu. Đang khởi động lại bộ đọc.');
+      assertCurrent();
+      collect(result.data);
+      if (readings.some(reading => reading.confidence >= 45)) return readings;
     }
   }
-
-  return null;
+  await withRecognitionTimeout(worker.setParameters({ tessedit_pageseg_mode: '11' }), 20000, 'Bộ OCR không phản hồi. Đang khởi động lại.');
+  const scene = await withRecognitionTimeout(worker.recognize(candidate.canvas), 20000, 'OCR xử lý quá lâu. Đang khởi động lại bộ đọc.');
+  assertCurrent();
+  collect(scene.data);
+  const regions = plateTextRegions(scene.data, candidate.canvas.width, candidate.canvas.height);
+  for (const region of regions) {
+    const crop = document.createElement('canvas');
+    crop.width = region.width;
+    crop.height = region.height;
+    crop.getContext('2d').drawImage(candidate.canvas, region.x, region.y, region.width, region.height,
+      0, 0, region.width, region.height);
+    await withRecognitionTimeout(worker.setParameters({ tessedit_pageseg_mode: '7' }), 20000, 'Bộ OCR không phản hồi. Đang khởi động lại.');
+    const result = await withRecognitionTimeout(worker.recognize(enhanceCanvasForOCR(crop)), 20000, 'OCR xử lý quá lâu. Đang khởi động lại bộ đọc.');
+    assertCurrent();
+    collect(result.data);
+  }
+  return readings;
 }
 
 // Xử lý khi quét đợt này chưa ra kết quả: Đếm ngược 5 giây rồi tự động quét lại
-function handleRecognitionFailedAndScheduleRetry(isManual) {
+function handleRecognitionFailedAndScheduleRetry(isManual, message = 'Chưa rõ biển số') {
   const hudPlate = document.getElementById('hud-plate-display');
   const hudAction = document.getElementById('hud-gate-action');
   
@@ -418,7 +574,7 @@ function handleRecognitionFailedAndScheduleRetry(isManual) {
   // Đếm ngược 5 giây
   let countdown = 5;
   if (hudAction) {
-    hudAction.textContent = `Chưa rõ biển số. Tự động chụp lại sau ${countdown}s...`;
+    hudAction.textContent = `${message}. Tự động chụp lại sau ${countdown}s...`;
     hudAction.className = 'font-semibold text-amber-400';
   }
 
@@ -426,17 +582,21 @@ function handleRecognitionFailedAndScheduleRetry(isManual) {
   countdownInterval = setInterval(() => {
     countdown--;
     if (countdown > 0) {
-      if (hudAction) hudAction.textContent = `Chưa rõ biển số. Tự động chụp lại sau ${countdown}s...`;
+      if (hudAction) hudAction.textContent = `${message}. Tự động chụp lại sau ${countdown}s...`;
     } else {
       clearInterval(countdownInterval);
     }
   }, 1000);
 
   if (retryTimer) clearTimeout(retryTimer);
+  retryIsManual = isManual;
+  const session = recognitionSessionId;
   retryTimer = setTimeout(() => {
-    if (webcamStream) {
+    retryTimer = null;
+    retryIsManual = false;
+    if (webcamStream && session === recognitionSessionId && (isManual || currentVehicleAtEntry === 1)) {
       console.log('🔄 [Hết 5s chờ] Tự động bắt đầu đợt chụp 20 ảnh tiếp theo...');
-      run20FramesCaptureCycle(false);
+      run20FramesCaptureCycle(isManual);
     }
   }, 5000);
 
@@ -456,13 +616,23 @@ async function run20FramesCaptureCycle(isManual = false) {
   const btnScan = document.getElementById('text-btn-scan');
   const laser = document.getElementById('hud-laser-line');
 
-  if (!video || !webcamStream || video.videoWidth === 0) {
+  if (!video || !webcamStream) {
     if (isManual) alert('Vui lòng bấm "Bật Camera" trước khi quét!');
     return;
   }
 
   if (isCycleRunning) return;
   isCycleRunning = true;
+  activeCycleIsManual = isManual;
+  const session = recognitionSessionId;
+  activeCycleSession = session;
+  retryIsManual = false;
+  const stream = webcamStream;
+  const assertCurrent = () => {
+    if (session !== recognitionSessionId || webcamStream !== stream || (!isManual && currentVehicleAtEntry !== 1)) {
+      throw new DOMException('Đã dừng quét', 'AbortError');
+    }
+  };
 
   if (retryTimer) clearTimeout(retryTimer);
   if (countdownInterval) clearInterval(countdownInterval);
@@ -480,11 +650,13 @@ async function run20FramesCaptureCycle(isManual = false) {
   }
 
   const startTime = performance.now();
+  let phase = 'ocr';
 
   try {
-    if (!tesseractWorker) {
-      await initTesseractWorker();
-    }
+    await waitForVideoReady(video);
+    assertCurrent();
+    const worker = await withRecognitionTimeout(initTesseractWorker(), 45000, 'Không tải được bộ OCR. Kiểm tra mạng rồi thử lại.');
+    assertCurrent();
 
     const vw = video.videoWidth;
     const vh = video.videoHeight;
@@ -495,10 +667,10 @@ async function run20FramesCaptureCycle(isManual = false) {
     const INTERVAL_MS = 90;
 
     for (let i = 1; i <= TOTAL_FRAMES; i++) {
-      if (!webcamStream) break;
+      assertCurrent();
 
       const frameCanvas = document.createElement('canvas');
-      const targetW = 800;
+      const targetW = Math.min(vw, 1280);
       const targetH = Math.round((vh / vw) * targetW);
       frameCanvas.width = targetW;
       frameCanvas.height = targetH;
@@ -525,9 +697,9 @@ async function run20FramesCaptureCycle(isManual = false) {
       throw new Error('Không chụp được khung hình');
     }
 
-    // Sắp xếp chọn ra 3 bức ảnh có độ nét CAO NHẤT
+    // Keep several independent frames so one sharp OCR mistake cannot open the gate.
     burstFrames.sort((a, b) => b.sharpness - a.sharpness);
-    const topFrames = burstFrames.slice(0, 3);
+    const topFrames = burstFrames.slice(0, 5);
     const bestFrame = topFrames[0];
 
     console.log(`📸 [Chụp 20 ảnh xong] Top 1 nét nhất: ${bestFrame.sharpness.toFixed(1)} (Frame #${bestFrame.index})`);
@@ -542,58 +714,85 @@ async function run20FramesCaptureCycle(isManual = false) {
     }
 
     // Thử nhận diện lần lượt với top các ảnh nét nhất
-    let detectedPlate = null;
-    let confidence = 0.98;
-
-    if (tesseractWorker) {
-      for (const candidate of topFrames) {
-        const enhanced = enhanceCanvasForOCR(candidate.canvas);
-        const res = await tesseractWorker.recognize(enhanced);
-        const plate = cleanAndFormatPlate(res.data.text);
-        if (plate) {
-          detectedPlate = plate;
-          console.log(`✅ [Thành công] Nhận diện được biển số: ${detectedPlate} từ frame #${candidate.index} (Độ nét: ${candidate.sharpness.toFixed(1)})`);
-          break;
-        }
-      }
+    const readings = [];
+    let stableReading = null;
+    for (const candidate of topFrames) {
+      assertCurrent();
+      readings.push(...await readPlateFrame(worker, candidate, assertCurrent));
+      stableReading = ParkingAlpr.selectStableReading(readings);
+      if (stableReading) break;
     }
+    const detectedPlate = stableReading?.plate;
+    const confidence = stableReading?.confidence;
 
     const elapsed = Math.round(performance.now() - startTime);
 
     if (detectedPlate) {
       // NHẬN DIỆN THÀNH CÔNG!
       lastRecognizedPlate = detectedPlate;
+      lastRecognizedConfidence = confidence;
       lastRecognizedTime = Date.now();
-      showToast(`⚡ Nhận diện thành công [${detectedPlate}] trong ${elapsed}ms!`);
+      hudPlate.textContent = detectedPlate;
+      if (hudConf) hudConf.textContent = `${confidence.toFixed(1)}%`;
+      if (hudTime) hudTime.textContent = new Date().toLocaleTimeString('vi-VN');
+      if (hudAction) hudAction.textContent = 'Đã đọc biển số. Đang kiểm tra với máy chủ...';
 
       // Gửi ngay lên Cloud Server để đối chiếu Whitelist CSDL và ra quyết định
-      const resp = await fetch('/api/parking/alpr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          plate: detectedPlate,
-          gate: 'entry',
-          confidence: confidence
-        })
-      });
-      const data = await resp.json();
-      console.log('Kết quả từ Cloud Server:', data);
+      assertCurrent();
+      phase = 'server';
+      const request = new AbortController();
+      activeRecognitionRequest = request;
+      const requestTimer = setTimeout(() => request.abort(), 15000);
+      let data;
+      try {
+        const resp = await fetch('/api/parking/alpr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: request.signal,
+          body: JSON.stringify({ plate: detectedPlate, gate: 'entry', confidence: confidence / 100 })
+        });
+        data = await resp.json();
+        assertCurrent();
+        if (!resp.ok || data.status !== 'success') throw new Error(data.message || `Máy chủ báo lỗi HTTP ${resp.status}`);
+      } finally {
+        clearTimeout(requestTimer);
+        if (activeRecognitionRequest === request) activeRecognitionRequest = null;
+      }
+      const allowed = data.decision === 'VALID';
+      hudPlate.className = `px-4 py-2.5 rounded-xl font-mono text-center font-black text-2xl tracking-widest ${allowed ? 'bg-emerald-400 text-slate-950' : 'bg-amber-400 text-slate-950'}`;
+      if (hudAction) {
+        hudAction.textContent = data.action || (allowed ? 'Biển số hợp lệ' : 'Biển số chưa được phép vào bãi');
+        hudAction.className = allowed ? 'font-semibold text-emerald-400' : 'font-semibold text-amber-400';
+      }
+      const plateStat = document.getElementById('stat-plate-text');
+      if (plateStat) plateStat.textContent = detectedPlate;
+      showToast(`Đã đọc ${detectedPlate} trong ${elapsed}ms và gửi máy chủ thành công.`);
 
-      isCycleRunning = false;
       if (laser) laser.classList.add('opacity-0');
       if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
       return; // Dừng, không quét lại nữa
     } else {
       // CHƯA NHẬN DIỆN ĐƯỢC -> HẸN GIỜ 5S SAU TỰ ĐỘNG CHỤP LẠI
-      handleRecognitionFailedAndScheduleRetry(isManual);
+      handleRecognitionFailedAndScheduleRetry(isManual, readings.length ? 'Các ảnh chưa đọc ra cùng một biển số' : 'Chưa đọc rõ biển số; đưa biển số gần hơn và giữ thẳng');
     }
   } catch (err) {
+    if (session !== recognitionSessionId || webcamStream !== stream) return;
     console.error('Lỗi chu kỳ quét:', err);
-    handleRecognitionFailedAndScheduleRetry(isManual);
+    if (phase === 'server') {
+      if (hudAction) hudAction.textContent = `Đã đọc ${lastRecognizedPlate}, nhưng chưa gửi được máy chủ. Bấm quét lại để thử gửi lại.`;
+      showToast('Đã đọc biển số nhưng gửi máy chủ thất bại. Kiểm tra kết nối web.');
+    } else {
+      if (err.message.includes('OCR')) await resetTesseractWorker();
+      handleRecognitionFailedAndScheduleRetry(isManual, err.message);
+    }
   } finally {
-    isCycleRunning = false;
-    if (laser) laser.classList.add('opacity-0');
-    if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
+    if (activeCycleSession === session) {
+      isCycleRunning = false;
+      activeCycleSession = null;
+      activeCycleIsManual = false;
+      if (laser) laser.classList.add('opacity-0');
+      if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
+    }
   }
 }
 
@@ -601,7 +800,7 @@ async function run20FramesCaptureCycle(isManual = false) {
 function manualTriggerScan() {
   if (!webcamStream) {
     toggleWebcamPreview().then(() => {
-      setTimeout(() => run20FramesCaptureCycle(true), 800);
+      if (webcamStream) run20FramesCaptureCycle(true);
     });
     return;
   }
@@ -629,16 +828,17 @@ function handleVehicleArrivalSensor(isArrived) {
       // Tự động bật camera nếu đang tắt
       if (!webcamStream) {
         startCameraStream().then(() => {
-          setTimeout(() => run20FramesCaptureCycle(false), 600);
+          if (webcamStream && currentVehicleAtEntry === 1) run20FramesCaptureCycle(false);
         });
       } else {
         run20FramesCaptureCycle(false);
       }
     }
   } else {
+    const wasPresent = currentVehicleAtEntry === 1;
     currentVehicleAtEntry = 0;
-    if (retryTimer) clearTimeout(retryTimer);
-    if (countdownInterval) clearInterval(countdownInterval);
+    if (wasPresent && !activeCycleIsManual && !retryIsManual) cancelRecognitionCycle();
+    if (!wasPresent || activeCycleIsManual || retryIsManual) return;
 
     // Khi xe đi qua, sau 4s đưa giao diện về trạng thái CHỜ XE ĐẾN
     setTimeout(() => {
@@ -1088,5 +1288,5 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchLogs();
   fetchAnalytics();
   populateCameraList();
-  initTesseractWorker(); // Nạp sẵn Tesseract Worker vào RAM
+  initTesseractWorker().catch(err => console.warn('OCR chưa sẵn sàng:', err));
 });
