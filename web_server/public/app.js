@@ -164,6 +164,8 @@ function initWebSocket() {
 
         if (msg.event) prependEventLog(msg.event);
         fetchAnalytics();
+      } else if (msg.type === 'vehicles_updated') {
+        fetchVehicles();
       }
     } catch (e) {
       console.error('Error parsing WS message:', e);
@@ -1281,12 +1283,130 @@ function showToast(msg) {
   setTimeout(() => toast.remove(), 2800);
 }
 
+// ================= QUẢN LÝ DANH SÁCH BIỂN SỐ XE HỢP LỆ (WHITELIST) =================
+
+async function fetchVehicles() {
+  const tbody = document.getElementById('whitelist-table-body');
+  const countBadge = document.getElementById('badge-vehicle-count');
+  if (!tbody) return;
+
+  try {
+    const res = await fetch('/api/parking/vehicles');
+    const data = await res.json();
+    if (data.status === 'success') {
+      const vehicles = data.vehicles || [];
+      if (countBadge) countBadge.textContent = `${vehicles.length} xe`;
+
+      if (vehicles.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="6" class="py-6 text-center text-slate-500 font-normal">
+              Chưa có biển số xe nào được đăng ký. Hãy thêm biển số đầu tiên ở trên!
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
+      tbody.innerHTML = vehicles.map((v, idx) => {
+        const dateStr = v.created_at ? new Date(v.created_at).toLocaleString('vi-VN') : '--';
+        return `
+          <tr class="hover:bg-slate-900/60 transition group">
+            <td class="py-3 px-4 font-mono text-slate-500 text-[11px]">${idx + 1}</td>
+            <td class="py-3 px-4 font-mono font-bold tracking-widest text-emerald-400 text-sm">
+              <span class="bg-emerald-950/40 px-2 py-0.5 rounded-lg border border-emerald-500/30">${v.plate}</span>
+            </td>
+            <td class="py-3 px-4 text-slate-200 font-medium">${v.owner_name || 'Khách vãng lai'}</td>
+            <td class="py-3 px-4">
+              <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Hợp lệ
+              </span>
+            </td>
+            <td class="py-3 px-4 text-slate-400 font-mono text-[11px]">${dateStr}</td>
+            <td class="py-3 px-4 text-center">
+              <button onclick="deleteVehicle(${v.id}, '${v.plate}')" title="Xóa biển số ${v.plate}" class="px-2.5 py-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 transition flex items-center gap-1 mx-auto text-[11px] font-semibold">
+                <i class="fa-solid fa-trash-can"></i>
+                <span>Xóa</span>
+              </button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+  } catch (err) {
+    console.error('Lỗi lấy danh sách xe:', err);
+    tbody.innerHTML = `<tr><td colspan="6" class="py-4 text-center text-rose-400">Lỗi tải danh sách: ${err.message}</td></tr>`;
+  }
+}
+
+async function handleAddNewVehicle(e) {
+  e.preventDefault();
+  const inputPlate = document.getElementById('input-new-plate');
+  const inputOwner = document.getElementById('input-new-owner');
+  const btn = document.getElementById('btn-add-vehicle');
+
+  const plate = inputPlate.value.trim().toUpperCase();
+  const owner = inputOwner.value.trim();
+
+  if (!plate) {
+    alert('Vui lòng nhập biển số xe!');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner animate-spin"></i> <span>Đang lưu...</span>';
+
+  try {
+    const res = await fetch('/api/parking/vehicles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plate, owner_name: owner })
+    });
+    const data = await res.json();
+
+    if (data.status === 'success') {
+      showToast(`✅ Đã thêm biển số [${plate}] thành công!`);
+      inputPlate.value = '';
+      inputOwner.value = '';
+      fetchVehicles();
+    } else {
+      alert(data.message || 'Lỗi thêm biển số xe!');
+    }
+  } catch (err) {
+    alert('Lỗi kết nối máy chủ: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fa-solid fa-plus"></i> <span>Thêm Biển Số</span>';
+  }
+}
+
+async function deleteVehicle(id, plate) {
+  if (!confirm(`Xác nhận xóa biển số [${plate}] khỏi danh sách xe hợp lệ?`)) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/parking/vehicles/${id}`, { method: 'DELETE' });
+    const data = await res.json();
+
+    if (data.status === 'success') {
+      showToast(`🗑️ Đã xóa biển số [${plate}] khỏi hệ thống!`);
+      fetchVehicles();
+    } else {
+      alert(data.message || 'Lỗi khi xóa biển số xe!');
+    }
+  } catch (err) {
+    alert('Lỗi kết nối máy chủ: ' + err.message);
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   startClock();
   initWebSocket();
   initCharts();
   fetchLogs();
   fetchAnalytics();
+  fetchVehicles();
   populateCameraList();
   initTesseractWorker().catch(err => console.warn('OCR chưa sẵn sàng:', err));
 });

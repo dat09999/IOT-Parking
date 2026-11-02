@@ -509,6 +509,70 @@ app.post('/api/parking/reset', (req, res) => {
   res.json({ status: 'success', message: 'All logs and states reset successfully' });
 });
 
+// 8. Vehicle Whitelist Management Endpoints (Thêm / Xóa / Xem danh sách biển số)
+// 8.1 Lấy toàn bộ danh sách biển số xe đã đăng ký
+app.get('/api/parking/vehicles', (req, res) => {
+  db.all(`SELECT id, plate, owner_name, is_active, created_at FROM registered_vehicles ORDER BY id DESC`, (err, rows) => {
+    if (err) return res.status(500).json({ status: 'error', message: err.message });
+    res.json({ status: 'success', vehicles: rows || [] });
+  });
+});
+
+// 8.2 Thêm biển số xe mới vào danh sách Whitelist
+app.post('/api/parking/vehicles', (req, res) => {
+  const { plate, owner_name } = req.body;
+  if (!plate || !plate.trim()) {
+    return res.status(400).json({ status: 'error', message: 'Vui lòng nhập biển số xe!' });
+  }
+
+  const cleanPlate = plate.trim().toUpperCase();
+  const cleanOwner = (owner_name && owner_name.trim()) ? owner_name.trim() : 'Chưa đặt tên';
+
+  db.run(`INSERT INTO registered_vehicles (plate, owner_name) VALUES (?, ?)`, [cleanPlate, cleanOwner], function (err) {
+    if (err) {
+      if (err.message.includes('UNIQUE')) {
+        return res.status(400).json({ status: 'error', message: `Biển số '${cleanPlate}' đã tồn tại trong danh sách!` });
+      }
+      return res.status(500).json({ status: 'error', message: err.message });
+    }
+
+    const newVehicle = {
+      id: this.lastID,
+      plate: cleanPlate,
+      owner_name: cleanOwner,
+      is_active: 1,
+      created_at: new Date().toISOString()
+    };
+
+    broadcastToClients({ type: 'vehicles_updated' });
+
+    res.json({
+      status: 'success',
+      message: `Đã thêm thành công biển số '${cleanPlate}' (${cleanOwner})`,
+      vehicle: newVehicle
+    });
+  });
+});
+
+// 8.3 Xóa biển số xe khỏi danh sách Whitelist
+app.delete('/api/parking/vehicles/:id', (req, res) => {
+  const vehicleId = parseInt(req.params.id, 10);
+  if (!vehicleId) {
+    return res.status(400).json({ status: 'error', message: 'ID không hợp lệ' });
+  }
+
+  db.run(`DELETE FROM registered_vehicles WHERE id=?`, [vehicleId], function (err) {
+    if (err) return res.status(500).json({ status: 'error', message: err.message });
+    if (this.changes === 0) {
+      return res.status(404).json({ status: 'error', message: 'Không tìm thấy biển số xe cần xóa' });
+    }
+
+    broadcastToClients({ type: 'vehicles_updated' });
+
+    res.json({ status: 'success', message: 'Đã xóa biển số xe thành công!' });
+  });
+});
+
 // 7. Health Check & Architecture Verification Endpoint
 app.get('/api/health', (req, res) => {
   res.json({
