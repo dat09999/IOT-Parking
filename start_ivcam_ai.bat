@@ -13,9 +13,15 @@ echo.
 cd /d "%~dp0\biensoxe\alpr_live"
 if errorlevel 1 goto folder_error
 
-:: Thu camera index 1 (iVCam thuong la camera so 1 neu laptop co webcam roi)
-:: Neu khong thay hinh iVCam, ban co the doi so 1 thanh 2 hoac 0
-set CAM_INDEX=1
+:: Thu camera index mac dinh la 0 hoac 1
+set CAM_INDEX=0
+echo.
+echo Danh sach lua chon Camera:
+echo   [0] Camera 0 (Mac dinh hoac Webcam / iVCam)
+echo   [1] Camera 1 (iVCam hoac Camera phu)
+echo.
+set /p USER_CHOICE="Chon camera [Nhan Enter mac dinh la 0, hoac go 1]: "
+if not "%USER_CHOICE%"=="" set CAM_INDEX=%USER_CHOICE%
 
 if exist ".venv\Scripts\python.exe" (
     echo Kiem tra Python cua du an...
