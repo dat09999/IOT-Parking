@@ -563,12 +563,12 @@ async function readPlateFrame(worker, candidate, assertCurrent) {
   return readings;
 }
 
-// Xử lý khi quét đợt này chưa ra kết quả: Đếm ngược 5 giây rồi tự động quét lại
-function handleRecognitionFailedAndScheduleRetry(isManual, message = 'Chưa rõ biển số') {
+// Xử lý khi quét đợt này chưa ra kết quả hoặc biển số sai: Đếm ngược 5 giây rồi tự động quét lại
+function handleRecognitionFailedAndScheduleRetry(isManual, message = 'Chưa rõ biển số', preservePlateText = false) {
   const hudPlate = document.getElementById('hud-plate-display');
   const hudAction = document.getElementById('hud-gate-action');
   
-  if (hudPlate && !hudPlate.classList.contains('bg-emerald-400')) {
+  if (!preservePlateText && hudPlate && !hudPlate.classList.contains('bg-emerald-400')) {
     hudPlate.textContent = 'CHƯA RÕ BIỂN SỐ';
     hudPlate.className = 'bg-slate-700 text-slate-300 px-4 py-2.5 rounded-xl font-mono text-center font-bold text-xl tracking-wider';
   }
@@ -602,7 +602,7 @@ function handleRecognitionFailedAndScheduleRetry(isManual, message = 'Chưa rõ 
     }
   }, 5000);
 
-  if (isManual) {
+  if (isManual && !preservePlateText) {
     showToast('⚠️ Chưa đọc được biển số. Hệ thống sẽ tự động quét lại sau 5s!');
   }
 }
@@ -768,11 +768,20 @@ async function run20FramesCaptureCycle(isManual = false) {
       }
       const plateStat = document.getElementById('stat-plate-text');
       if (plateStat) plateStat.textContent = detectedPlate;
-      showToast(`Đã đọc ${detectedPlate} trong ${elapsed}ms và gửi máy chủ thành công.`);
 
       if (laser) laser.classList.add('opacity-0');
       if (btnScan) btnScan.textContent = '⚡ Quét Thử Ngay';
-      return; // Dừng, không quét lại nữa
+
+      if (allowed) {
+        showToast(`✅ Đã đọc ${detectedPlate} trong ${elapsed}ms và gửi máy chủ thành công.`);
+        return; // Hợp lệ -> mở cổng thành công, dừng quét
+      }
+
+      // Biển số sai / chưa đăng ký / bị từ chối -> đếm ngược 5s và tự động quét lại!
+      const reason = data.action || 'Biển số chưa được phép vào bãi';
+      showToast(`⚠️ Biển số ${detectedPlate}: ${reason}. Tự động quét lại sau 5s!`);
+      handleRecognitionFailedAndScheduleRetry(isManual, reason, true);
+      return;
     } else {
       // CHƯA NHẬN DIỆN ĐƯỢC -> HẸN GIỜ 5S SAU TỰ ĐỘNG CHỤP LẠI
       handleRecognitionFailedAndScheduleRetry(isManual, readings.length ? 'Các ảnh chưa đọc ra cùng một biển số' : 'Chưa đọc rõ biển số; đưa biển số gần hơn và giữ thẳng');

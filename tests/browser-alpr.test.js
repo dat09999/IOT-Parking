@@ -405,6 +405,35 @@ test('an HTTP failure preserves the recognized plate and reports a server failur
   assert.equal(harness.clock.jobs.size, 0, 'a server error must not masquerade as an OCR retry');
 });
 
+test('an invalid plate decision keeps the plate text and schedules an auto retry after 5 seconds', { timeout: 3000 }, async () => {
+  let fetchCount = 0;
+  const harness = createHarness({
+    recognize: async () => ({ data: { text: '36C-925.60', confidence: 95, lines: [] } }),
+    fetchResponse: async () => {
+      fetchCount++;
+      return {
+        ok: true, status: 200,
+        async json() {
+          return { status: 'success', plate: '36C-925.60', decision: 'INVALID', action: 'Biển số chưa được phép vào bãi' };
+        }
+      };
+    }
+  });
+  await harness.context.startCameraStream();
+  const scan = harness.context.run20FramesCaptureCycle(true);
+  await harness.clock.advance(2500);
+  await scan;
+
+  assert.equal(fetchCount, 1);
+  assert.equal(harness.getElement('hud-plate-display').textContent, '36C-925.60');
+  assert.ok(harness.getElement('hud-plate-display').classList.contains('bg-amber-400'));
+  assert.match(harness.getElement('hud-gate-action').textContent, /5s/);
+
+  // Sau 5s đếm ngược, chu kỳ quét tiếp theo sẽ tự động được gọi
+  await harness.clock.advance(7500);
+  assert.ok(fetchCount >= 2, 'phải tự động quét lại sau 5s khi biển số không hợp lệ');
+});
+
 function pixelFixture({ rectangle, plateColor = [245, 245, 245], holes = true, background = [20, 20, 20] } = {}) {
   const image = { width: 1280, height: 720, pixels: new Uint8ClampedArray(1280 * 720 * 4) };
   function fillRect(x, y, width, height, color) {
